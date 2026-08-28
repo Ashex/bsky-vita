@@ -15,3 +15,6 @@ credentials.toml
 .idea/
 *.swp
 .DS_Store
+
+# Local runtime logs
+/run.log
