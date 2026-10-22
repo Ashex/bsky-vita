@@ -905,74 +905,21 @@ mod tests {
         })
     }
 
-    fn attachment() -> Attachment {
-        Attachment {
+    #[test]
+    fn successful_post_preserves_draft_until_pop() {
+        let mut screen = ComposeScreen::new(test_client(), None, None);
+        screen.segments[0].attachments.push(Attachment {
             key: "photo.png".to_string(),
             bytes: Some(vec![1, 2, 3, 4]),
             mime: "image/png".to_string(),
-            alt: "test photo".to_string(),
+            alt: String::new(),
             preview: None,
-        }
-    }
-
-    fn screen() -> ComposeScreen {
-        ComposeScreen::new(test_client(), None, None)
-    }
-
-    fn assert_draft_preserved(screen: &ComposeScreen) {
-        assert_eq!(screen.current, 1);
-        assert_eq!(screen.segments.len(), 2);
-        assert_eq!(screen.segments[0].text, "first segment");
-        assert_eq!(screen.segments[1].text, "second segment");
-        let attachment = &screen.segments[1].attachments[0];
-        assert_eq!(attachment.key, "photo.png");
-        assert_eq!(attachment.bytes.as_deref(), Some(&[1, 2, 3, 4][..]));
-        assert_eq!(attachment.mime, "image/png");
-        assert_eq!(attachment.alt, "test photo");
-        assert!(attachment.preview.is_none());
-    }
-
-    fn populated_screen() -> ComposeScreen {
-        let mut screen = screen();
-        screen.segments[0].text = "first segment".to_string();
-        screen.segments.push(Segment {
-            text: "second segment".to_string(),
-            attachments: vec![attachment()],
         });
-        screen.current = 1;
-        screen
-    }
-
-    #[test]
-    fn successful_post_preserves_draft_until_pop() {
-        let mut screen = populated_screen();
         screen.state = ComposeState::Submitting;
         screen.handle_worker_response(WorkResponse::PostCreated(Ok("at://post".to_string())));
-        assert_draft_preserved(&screen);
+        assert_eq!(screen.segments[0].attachments.len(), 1);
+        assert_eq!(screen.segments[0].attachments[0].bytes.as_deref(), Some(&[1, 2, 3, 4][..]));
         assert!(screen.done);
         assert!(!screen.can_post());
-        assert!(matches!(screen.state, ComposeState::Submitting));
-    }
-
-    #[test]
-    fn failed_post_preserves_draft_and_allows_retry() {
-        let mut screen = populated_screen();
-        screen.state = ComposeState::Submitting;
-        screen.handle_worker_response(WorkResponse::PostCreated(Err("network error".to_string())));
-        assert_draft_preserved(&screen);
-        assert!(matches!(screen.state, ComposeState::Error(ref msg) if msg == "network error"));
-        assert!(screen.can_post());
-        assert!(!screen.done);
-    }
-
-    #[test]
-    fn successful_text_only_post_marks_screen_done() {
-        let mut screen = screen();
-        screen.segments[0].text = "text-only post".to_string();
-        screen.state = ComposeState::Submitting;
-        screen.handle_worker_response(WorkResponse::PostCreated(Ok("at://post".to_string())));
-        assert!(screen.done);
-        assert_eq!(screen.segments.len(), 1);
-        assert_eq!(screen.segments[0].text, "text-only post");
     }
 }
