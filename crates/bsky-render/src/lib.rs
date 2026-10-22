@@ -30,17 +30,15 @@
 
 #![allow(clippy::needless_doctest_main)]
 
+mod emoji_cache;
+mod emoji_font;
+mod emoji_layout;
 #[cfg(target_os = "vita")]
 mod ffi;
 #[cfg(target_os = "vita")]
 mod video_shader;
 #[cfg(target_os = "vita")]
 mod video_shader_src;
-// ATLAS_COLS / ATLAS_ROWS are used by external tooling readers; keep
-// them in the generated file for documentation even if unread by us.
-mod emoji_layout;
-#[allow(dead_code)]
-mod emoji_table;
 
 /// A YUV420 video frame as three GXM-bindable luma-format textures
 /// (Y at full resolution, U/V at half). Unique to video playback —
@@ -76,11 +74,9 @@ use core::ffi::c_uint;
 use core::marker::PhantomData;
 #[cfg(target_os = "vita")]
 use core::ptr::NonNull;
-use sha2::Digest;
 use std::collections::{HashMap, VecDeque};
 #[cfg(target_os = "vita")]
 use std::ffi::CString;
-use std::io::{Read, Seek};
 
 /// Display dimensions. The Vita's framebuffer is fixed at 960×544 regardless
 /// of model (OG OLED, slim LCD, or PSTV — PSTV upscales to TV via system).
@@ -195,7 +191,6 @@ impl core::fmt::Display for RenderError {
 /// rasterized pixels per stroke for clean antialiasing. PGF rendering
 /// ignores this — it uses the float `scale` directly because PGF is a
 /// bitmap font with its own native size.
-#[cfg(target_os = "vita")]
 const BASE_SIZE_PX: u32 = 20;
 
 /// Convert the `scale: f32` carried through the bsky-render API into the
@@ -470,7 +465,7 @@ impl Texture {
         }
     }
 
-    /// Load a PNG from a Vita filesystem path (e.g. `app0:twemoji.png`).
+    /// Load a PNG from a Vita filesystem path.
     pub fn from_png_file(path: &str) -> Result<Self, RenderError> {
         #[cfg(target_os = "vita")]
         {
@@ -845,86 +840,370 @@ impl Drop for Texture {
     }
 }
 
-fn validate_emoji_atlas(
-    path: &str,
-    expected_width: u32,
-    expected_height: u32,
-    expected_fingerprint: &str,
-) -> Result<(), RenderError> {
-    let mut file = std::fs::File::open(path)
-        .map_err(|_| RenderError::TextureLoad("emoji atlas fingerprint"))?;
-    let length = file
-        .metadata()
-        .map_err(|_| RenderError::TextureLoad("emoji atlas fingerprint"))?
-        .len();
-    if !(33..=16 * 1024 * 1024).contains(&length) {
-        return Err(RenderError::TextureLoad("emoji atlas PNG size"));
-    }
-    let mut header = [0u8; 24];
-    file.read_exact(&mut header)
-        .map_err(|_| RenderError::TextureLoad("emoji atlas PNG header"))?;
-    if &header[..8] != b"\x89PNG\r\n\x1a\n" || &header[12..16] != b"IHDR" {
-        return Err(RenderError::TextureLoad("emoji atlas PNG header"));
-    }
-    let width = u32::from_be_bytes(header[16..20].try_into().unwrap());
-    let height = u32::from_be_bytes(header[20..24].try_into().unwrap());
-    if width != expected_width || height != expected_height {
-        return Err(RenderError::TextureLoad("emoji atlas dimensions"));
-    }
-    file.rewind()
-        .map_err(|_| RenderError::TextureLoad("emoji atlas fingerprint"))?;
-    let mut hasher = sha2::Sha256::new();
-    let mut chunk = [0u8; 8192];
-    loop {
-        let count = file
-            .read(&mut chunk)
-            .map_err(|_| RenderError::TextureLoad("emoji atlas fingerprint"))?;
-        if count == 0 {
-            break;
-        }
-        hasher.update(&chunk[..count]);
-    }
-    if format!("{:x}", hasher.finalize()) != expected_fingerprint {
-        return Err(RenderError::TextureLoad("stale emoji atlas"));
-    }
-    Ok(())
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+struct EmojiKey {
+    glyph_id: u32,
+    ppem: u32,
 }
 
-/// Color emoji sprite atlas + codepoint→cell lookup table. Loads
-/// `twemoji.png` (a single PNG with 64×64 cells in a 16-column grid) and
-/// exposes [`EmojiAtlas::lookup`] to find a codepoint's atlas cell.
-///
-/// Construct with [`EmojiAtlas::from_path`] at startup; pass a borrow
-/// through `UiCtx` to screens that render emoji-bearing text.
-pub struct EmojiAtlas {
+struct EmojiEntry {
+    metrics: emoji_font::BitmapMetrics,
+    slot: emoji_cache::Slot,
+}
+
+struct EmojiPage {
     texture: Texture,
+}
+
+const SHAPE_CACHE_ENTRIES: usize = 128;
+const SHAPE_CACHE_BYTES: usize = 128 * 1024;
+const SHAPE_CLUSTER_BYTES: usize = 4096;
+
+type ShapeResult = Option<Vec<emoji_font::Glyph>>;
+
+struct ShapeCache {
+    entries: HashMap<String, ShapeResult>,
+    order: VecDeque<String>,
+    bytes: usize,
+}
+
+impl ShapeCache {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+            bytes: 0,
+        }
+    }
+    fn get(&mut self, key: &str) -> Option<ShapeResult> {
+        let value = self.entries.get(key)?.clone();
+        self.order.retain(|entry| entry != key);
+        self.order.push_back(key.to_owned());
+        Some(value)
+    }
+    fn insert(&mut self, key: &str, value: ShapeResult) {
+        if key.len() > SHAPE_CLUSTER_BYTES {
+            return;
+        }
+        if let Some(old) = self.entries.remove(key) {
+            self.bytes -= key.len()
+                + old.as_ref().map_or(0, |glyphs| {
+                    glyphs.len() * std::mem::size_of::<emoji_font::Glyph>()
+                });
+            self.order.retain(|entry| entry != key);
+        }
+        let size = key.len()
+            + value.as_ref().map_or(0, |glyphs| {
+                glyphs.len() * std::mem::size_of::<emoji_font::Glyph>()
+            });
+        if size > SHAPE_CACHE_BYTES {
+            return;
+        }
+        while self.entries.len() >= SHAPE_CACHE_ENTRIES || self.bytes + size > SHAPE_CACHE_BYTES {
+            let Some(old_key) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(old) = self.entries.remove(&old_key) {
+                self.bytes -= old_key.len()
+                    + old.as_ref().map_or(0, |glyphs| {
+                        glyphs.len() * std::mem::size_of::<emoji_font::Glyph>()
+                    });
+            }
+        }
+        self.bytes += size;
+        self.order.push_back(key.to_owned());
+        self.entries.insert(key.to_owned(), value);
+    }
+}
+
+/// Font-backed color emoji renderer with bounded deferred GPU uploads.
+pub struct EmojiAtlas {
+    font: std::cell::RefCell<emoji_font::EmojiFont>,
+    strike_ppem: u32,
+    cache: std::cell::RefCell<HashMap<EmojiKey, EmojiEntry>>,
+    pending: std::cell::RefCell<VecDeque<EmojiKey>>,
+    queued: std::cell::RefCell<std::collections::HashSet<EmojiKey>>,
+    shapes: std::cell::RefCell<ShapeCache>,
+    pages: std::cell::RefCell<Vec<EmojiPage>>,
+    policy: std::cell::RefCell<emoji_cache::Policy>,
+}
+
+impl Drop for EmojiAtlas {
+    fn drop(&mut self) {
+        if !self.pages.get_mut().is_empty() {
+            crate::wait_rendering_done();
+            self.pages.get_mut().clear();
+        }
+    }
 }
 
 impl EmojiAtlas {
     pub fn from_path(path: &str) -> Result<Self, RenderError> {
-        validate_emoji_atlas(
-            path,
-            emoji_table::ATLAS_COLS as u32 * emoji_table::CELL_PX as u32,
-            emoji_table::ATLAS_ROWS as u32 * emoji_table::CELL_PX as u32,
-            emoji_table::ATLAS_FINGERPRINT,
-        )?;
-        let texture = Texture::from_png_file(path)?;
-        Ok(Self { texture })
+        let font = emoji_font::EmojiFont::open(path)
+            .map_err(|_| RenderError::TextureLoad("emoji font"))?;
+        let strike_ppem = font.strike_ppem();
+        Ok(Self {
+            font: std::cell::RefCell::new(font),
+            strike_ppem,
+            cache: std::cell::RefCell::new(HashMap::new()),
+            pending: std::cell::RefCell::new(VecDeque::new()),
+            queued: std::cell::RefCell::new(std::collections::HashSet::new()),
+            shapes: std::cell::RefCell::new(ShapeCache::new()),
+            pages: std::cell::RefCell::new(Vec::new()),
+            policy: std::cell::RefCell::new(emoji_cache::Policy::new()),
+        })
     }
 
-    /// Look up a codepoint's atlas cell. `None` if the codepoint isn't
-    /// in the bundled set; the caller falls back to TTF text rendering.
-    pub fn lookup(&self, codepoint: u32) -> Option<(u16, u16)> {
-        emoji_table::lookup_sequence(&char::from_u32(codepoint)?.to_string())
+    fn target_ppem(&self, scale: f32) -> u32 {
+        ((BASE_SIZE_PX as f32 * scale).round().max(1.0) as u32).clamp(1, 48)
     }
 
-    fn lookup_sequence(&self, sequence: &str) -> Option<(u16, u16)> {
-        emoji_table::lookup_sequence(sequence)
+    fn shape(&self, text: &str, scale: f32) -> Option<(Vec<emoji_font::Glyph>, u32)> {
+        let glyphs = self.shaped(text)?;
+        let ppem = self.target_ppem(scale);
+        self.enqueue_glyphs(&glyphs, ppem);
+        Some((glyphs, ppem))
     }
 
-    /// Underlying texture (for direct draw via `Frame::draw_texture_part_scale`).
-    pub fn texture(&self) -> &Texture {
-        &self.texture
+    fn enqueue_glyphs(&self, glyphs: &[emoji_font::Glyph], ppem: u32) {
+        for glyph in glyphs {
+            if glyph.id == 0 {
+                continue;
+            }
+            let key = EmojiKey {
+                glyph_id: glyph.id,
+                ppem,
+            };
+            if self.cache.borrow().contains_key(&key)
+                || self.queued.borrow().contains(&key)
+                || self.policy.borrow().is_failed(Self::policy_key(key))
+            {
+                continue;
+            }
+            if self.pending.borrow().len() >= emoji_cache::PENDING_LIMIT {
+                continue;
+            }
+            if !self.policy.borrow_mut().queue(Self::policy_key(key)) {
+                continue;
+            }
+            self.pending.borrow_mut().push_back(key);
+            self.queued.borrow_mut().insert(key);
+        }
+    }
+
+    fn shaped_advance(glyphs: &[emoji_font::Glyph], ppem: u32, strike: u32) -> i32 {
+        let units: i64 = glyphs.iter().map(|g| i64::from(g.x_advance_26_6)).sum();
+        ((units * i64::from(ppem) + i64::from(strike * 32)) / (i64::from(strike) * 64)) as i32
+    }
+
+    fn shaped(&self, text: &str) -> Option<Vec<emoji_font::Glyph>> {
+        if text.len() > SHAPE_CLUSTER_BYTES {
+            return None;
+        }
+        if let Some(cached) = self.shapes.borrow_mut().get(text) {
+            return cached;
+        }
+        let result = self.font.borrow_mut().shape(text).ok().filter(|glyphs| {
+            glyphs.len() == 1 && glyphs[0].id != 0 && glyphs[0].x_advance_26_6 > 0
+        });
+        self.shapes.borrow_mut().insert(text, result.clone());
+        result
+    }
+
+    fn measure_sequence(&self, text: &str, scale: f32) -> Option<i32> {
+        let glyphs = self.shaped(text)?;
+        Some(Self::shaped_advance(
+            &glyphs,
+            self.target_ppem(scale),
+            self.strike_ppem,
+        ))
+    }
+
+    fn policy_key(key: EmojiKey) -> u64 {
+        (u64::from(key.glyph_id) << 32) | u64::from(key.ppem)
+    }
+
+    pub fn service_pending(&self, max_uploads: usize) {
+        let mut batch = Vec::new();
+        {
+            let mut pending = self.pending.borrow_mut();
+            for _ in 0..max_uploads.min(emoji_cache::UPLOAD_LIMIT) {
+                if let Some(item) = pending.pop_front() {
+                    batch.push(item);
+                } else {
+                    break;
+                }
+            }
+        }
+        if batch.is_empty() {
+            return;
+        }
+        crate::wait_rendering_done();
+        for key in batch {
+            let _ = self.policy.borrow_mut().pop_queue();
+            let rendered = self.font.borrow_mut().render_rgba(key.glyph_id, key.ppem);
+            let (metrics, pixels) = match rendered {
+                Ok(value)
+                    if value.0.width > 0
+                        && value.0.rows > 0
+                        && value.0.width <= 64
+                        && value.0.rows <= 64 =>
+                {
+                    value
+                }
+                _ => {
+                    self.policy.borrow_mut().fail(Self::policy_key(key));
+                    self.queued.borrow_mut().remove(&key);
+                    continue;
+                }
+            };
+            #[cfg(not(target_os = "vita"))]
+            {
+                let _ = (key, metrics, pixels);
+                self.queued.borrow_mut().remove(&key);
+                continue;
+            }
+            #[cfg(target_os = "vita")]
+            {
+                if self.pages.borrow().is_empty() {
+                    if let Ok(texture) = Texture::new_rgba(512, 512) {
+                        texture.upload_rgba(&vec![0; 512 * 512 * 4]);
+                        self.pages.borrow_mut().push(EmojiPage { texture });
+                    }
+                }
+                if self.pages.borrow().len() < emoji_cache::PAGE_COUNT {
+                    if let Ok(texture) = Texture::new_rgba(512, 512) {
+                        texture.upload_rgba(&vec![0; 512 * 512 * 4]);
+                        self.pages.borrow_mut().push(EmojiPage { texture });
+                    }
+                }
+                if self.pages.borrow().len() != emoji_cache::PAGE_COUNT {
+                    self.policy.borrow_mut().fail(Self::policy_key(key));
+                    self.queued.borrow_mut().remove(&key);
+                    continue;
+                }
+                let slot = self.policy.borrow_mut().allocate(Self::policy_key(key));
+                self.cache
+                    .borrow_mut()
+                    .retain(|_, entry| entry.slot != slot);
+                let x = (slot.slot % 8) * 64;
+                let y = (slot.slot / 8) * 64;
+                let stride = unsafe {
+                    ffi::vita2d_texture_get_stride(
+                        self.pages.borrow()[slot.page].texture.ptr.as_ptr(),
+                    ) as usize
+                };
+                let base = unsafe {
+                    ffi::vita2d_texture_get_datap(
+                        self.pages.borrow()[slot.page].texture.ptr.as_ptr(),
+                    ) as *mut u8
+                };
+                if !base.is_null()
+                    && stride >= 512 * 4
+                    && pixels.len() >= metrics.width as usize * metrics.rows as usize * 4
+                {
+                    unsafe {
+                        for row in 0..64 {
+                            core::ptr::write_bytes(base.add((y + row) * stride + x * 4), 0, 64 * 4);
+                        }
+                        for row in 0..metrics.rows as usize {
+                            core::ptr::copy_nonoverlapping(
+                                pixels.as_ptr().add(row * metrics.width as usize * 4),
+                                base.add((y + row) * stride + x * 4),
+                                metrics.width as usize * 4,
+                            );
+                        }
+                    }
+                    self.cache
+                        .borrow_mut()
+                        .insert(key, EmojiEntry { metrics, slot });
+                } else {
+                    self.policy.borrow_mut().fail(Self::policy_key(key));
+                }
+                self.queued.borrow_mut().remove(&key);
+            }
+        }
+    }
+
+    fn lookup_sequence(&self, sequence: &str) -> Option<()> {
+        let glyphs = self.shaped(sequence)?;
+        if glyphs.is_empty() {
+            return None;
+        }
+        Some(())
+    }
+
+    pub fn lookup(&self, _codepoint: u32) -> Option<(u16, u16)> {
+        None
+    }
+
+    fn draw_sequence(
+        &self,
+        frame: &mut Frame<'_>,
+        sequence: &str,
+        x: i32,
+        y: i32,
+        color: Color,
+        scale: f32,
+    ) -> i32 {
+        let Some((glyphs, ppem)) = self.shape(sequence, scale) else {
+            let width = self.fallback_advance(sequence, scale);
+            frame.fill_rect(
+                x as f32,
+                (y - self.target_ppem(scale) as i32) as f32,
+                width as f32,
+                self.target_ppem(scale) as f32,
+                color,
+            );
+            return x + width;
+        };
+        let advance = Self::shaped_advance(&glyphs, ppem, self.strike_ppem);
+        let mut pen = x;
+        for glyph in glyphs {
+            let key = EmojiKey {
+                glyph_id: glyph.id,
+                ppem,
+            };
+            if let Some(entry) = self.cache.borrow().get(&key) {
+                self.policy.borrow_mut().touch(Self::policy_key(key));
+                let xoff = ((i64::from(glyph.x_offset_26_6) * i64::from(ppem))
+                    / (i64::from(self.strike_ppem) * 64)) as i32;
+                let yoff = ((i64::from(glyph.y_offset_26_6) * i64::from(ppem))
+                    / (i64::from(self.strike_ppem) * 64)) as i32;
+                let page = &self.pages.borrow()[entry.slot.page].texture;
+                let sx = (entry.slot.slot % 8) * 64;
+                let sy = (entry.slot.slot / 8) * 64;
+                frame.draw_texture_part_scale(
+                    page,
+                    (pen + entry.metrics.left + xoff) as f32,
+                    (y - entry.metrics.top - yoff) as f32,
+                    sx as f32,
+                    sy as f32,
+                    entry.metrics.width as f32,
+                    entry.metrics.rows as f32,
+                    1.0,
+                    1.0,
+                );
+            } else {
+                let one =
+                    Self::shaped_advance(std::slice::from_ref(&glyph), ppem, self.strike_ppem)
+                        .max(1);
+                frame.fill_rect(
+                    pen as f32,
+                    (y - ppem as i32) as f32,
+                    one as f32,
+                    ppem as f32,
+                    color,
+                );
+            }
+            pen += Self::shaped_advance(std::slice::from_ref(&glyph), ppem, self.strike_ppem);
+        }
+        x + advance
+    }
+
+    fn fallback_advance(&self, sequence: &str, scale: f32) -> i32 {
+        let _ = sequence;
+        self.target_ppem(scale) as i32
     }
 }
 
@@ -1426,13 +1705,14 @@ impl<'r> Frame<'r> {
         text: &str,
         emoji: Option<&EmojiAtlas>,
     ) -> (i32, i32) {
-        let text = emoji_layout::normalize_text(text);
-        let text = text.as_ref();
         let Some(atlas) = emoji else {
             let width: i32 = emoji_layout::tokens(text, |_| false)
                 .into_iter()
                 .map(|token| match token {
-                    emoji_layout::Token::Text(run) => self.measure_text(font, scale, run).0,
+                    emoji_layout::Token::Text(run) => {
+                        self.measure_text(font, scale, &emoji_layout::text_run(run))
+                            .0
+                    }
                     emoji_layout::Token::Emoji(_) | emoji_layout::Token::Fallback(_) => {
                         self.emoji_render_size(scale)
                     }
@@ -1443,9 +1723,16 @@ impl<'r> Frame<'r> {
         let mut width = 0;
         for token in emoji_layout::tokens(text, |g| atlas.lookup_sequence(g).is_some()) {
             match token {
-                emoji_layout::Token::Text(run) => width += self.measure_text(font, scale, run).0,
-                emoji_layout::Token::Emoji(_) | emoji_layout::Token::Fallback(_) => {
-                    width += self.emoji_render_size(scale)
+                emoji_layout::Token::Text(run) => {
+                    width += self.measure_text(font, scale, &emoji_layout::text_run(run)).0
+                },
+                emoji_layout::Token::Emoji(sequence) => {
+                    width += atlas
+                        .measure_sequence(sequence, scale)
+                        .unwrap_or_else(|| atlas.fallback_advance(sequence, scale))
+                }
+                emoji_layout::Token::Fallback(sequence) => {
+                    width += atlas.fallback_advance(sequence, scale)
                 }
             }
         }
@@ -1488,8 +1775,6 @@ impl<'r> Frame<'r> {
         text: &str,
         emoji: Option<&EmojiAtlas>,
     ) -> i32 {
-        let text = emoji_layout::normalize_text(text);
-        let text = text.as_ref();
         match emoji {
             None => {
                 let size = self.emoji_render_size(scale);
@@ -1497,10 +1782,12 @@ impl<'r> Frame<'r> {
                 for token in emoji_layout::tokens(text, |_| false) {
                     match token {
                         emoji_layout::Token::Text(run) => {
-                            self.draw_text(font, current_x, y, color, scale, run);
-                            current_x += self.measure_text(font, scale, run).0;
+                            let run = emoji_layout::text_run(run);
+                            self.draw_text(font, current_x, y, color, scale, &run);
+                            current_x += self.measure_text(font, scale, &run).0;
                         }
-                        emoji_layout::Token::Emoji(_) | emoji_layout::Token::Fallback(_) => {
+                        emoji_layout::Token::Emoji(sequence)
+                        | emoji_layout::Token::Fallback(sequence) => {
                             self.fill_rect(
                                 current_x as f32,
                                 (y - size) as f32,
@@ -1509,6 +1796,7 @@ impl<'r> Frame<'r> {
                                 color,
                             );
                             current_x += size;
+                            let _ = sequence;
                         }
                     }
                 }
@@ -1686,12 +1974,17 @@ impl<'r> Frame<'r> {
         word: &str,
         atlas: &EmojiAtlas,
     ) -> i32 {
-        let emoji_w = self.emoji_render_size(scale);
         emoji_layout::tokens(word, |g| atlas.lookup_sequence(g).is_some())
             .into_iter()
             .map(|token| match token {
-                emoji_layout::Token::Text(run) => self.measure_text(font, scale, run).0,
-                emoji_layout::Token::Emoji(_) | emoji_layout::Token::Fallback(_) => emoji_w,
+                emoji_layout::Token::Text(run) => {
+                    self.measure_text(font, scale, &emoji_layout::text_run(run))
+                        .0
+                }
+                emoji_layout::Token::Emoji(sequence) => atlas
+                    .measure_sequence(sequence, scale)
+                    .unwrap_or_else(|| atlas.fallback_advance(sequence, scale)),
+                emoji_layout::Token::Fallback(sequence) => atlas.fallback_advance(sequence, scale),
             })
             .sum()
     }
@@ -1714,43 +2007,28 @@ impl<'r> Frame<'r> {
         word: &str,
         atlas: &EmojiAtlas,
     ) -> i32 {
-        let emoji_w = self.emoji_render_size(scale);
-        let cell = emoji_table::CELL_PX as f32;
-        let scale_factor = emoji_w as f32 / cell;
-        let emoji_y_top = y - emoji_w; // baseline at y → bottom of emoji at y
-
         let mut current_x = x;
         for token in emoji_layout::tokens(word, |g| atlas.lookup_sequence(g).is_some()) {
             match token {
                 emoji_layout::Token::Text(run) => {
-                    self.draw_text(font, current_x, y, color, scale, run);
-                    current_x += self.measure_text(font, scale, run).0;
+                    let run = emoji_layout::text_run(run);
+                    self.draw_text(font, current_x, y, color, scale, &run);
+                    current_x += self.measure_text(font, scale, &run).0;
                 }
                 emoji_layout::Token::Emoji(sequence) => {
-                    if let Some((col, row)) = emoji_table::lookup_sequence(sequence) {
-                        self.draw_texture_part_scale(
-                            atlas.texture(),
-                            current_x as f32,
-                            emoji_y_top as f32,
-                            col as f32 * cell,
-                            row as f32 * cell,
-                            cell,
-                            cell,
-                            scale_factor,
-                            scale_factor,
-                        );
-                        current_x += emoji_w;
-                    }
+                    let next = atlas.draw_sequence(self, sequence, current_x, y, color, scale);
+                    current_x = next;
                 }
-                emoji_layout::Token::Fallback(_) => {
+                emoji_layout::Token::Fallback(sequence) => {
+                    let width = atlas.fallback_advance(sequence, scale);
                     self.fill_rect(
                         current_x as f32,
-                        emoji_y_top as f32,
-                        emoji_w as f32,
-                        emoji_w as f32,
+                        (y - atlas.target_ppem(scale) as i32) as f32,
+                        width as f32,
+                        atlas.target_ppem(scale) as f32,
                         color,
                     );
-                    current_x += emoji_w;
+                    current_x += width;
                 }
             }
         }
@@ -1789,37 +2067,6 @@ impl<'r> Drop for Frame<'r> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn emoji_atlas_validation_checks_header_dimensions_and_fingerprint() {
-        let atlas = concat!(env!("CARGO_MANIFEST_DIR"), "/../../app/static/twemoji.png");
-        validate_emoji_atlas(atlas, 1024, 2560, emoji_table::ATLAS_FINGERPRINT).unwrap();
-
-        let dir = std::env::temp_dir().join(format!("bsky-vita-atlas-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("atlas.png");
-        let mut data = std::fs::read(atlas).unwrap();
-        let write = |bytes: &[u8]| {
-            std::fs::write(&path, bytes).unwrap();
-        };
-        assert!(validate_emoji_atlas(dir.join("missing.png").to_str().unwrap(), 1024, 2560, emoji_table::ATLAS_FINGERPRINT).is_err());
-        write(b"not a png");
-        assert!(validate_emoji_atlas(path.to_str().unwrap(), 1024, 2560, emoji_table::ATLAS_FINGERPRINT).is_err());
-        data[19] ^= 1;
-        write(&data);
-        assert!(validate_emoji_atlas(path.to_str().unwrap(), 1024, 2560, emoji_table::ATLAS_FINGERPRINT).is_err());
-        data = std::fs::read(atlas).unwrap();
-        data[40] ^= 1;
-        write(&data);
-        assert!(validate_emoji_atlas(path.to_str().unwrap(), 1024, 2560, emoji_table::ATLAS_FINGERPRINT).is_err());
-        data = std::fs::read(atlas).unwrap();
-        data.push(0);
-        write(&data);
-        assert!(validate_emoji_atlas(path.to_str().unwrap(), 1024, 2560, emoji_table::ATLAS_FINGERPRINT).is_err());
-        write(&vec![0; 16 * 1024 * 1024 + 1]);
-        assert!(validate_emoji_atlas(path.to_str().unwrap(), 1024, 2560, emoji_table::ATLAS_FINGERPRINT).is_err());
-        let _ = std::fs::remove_dir_all(dir);
-    }
 
     #[test]
     #[allow(non_snake_case)]

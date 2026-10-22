@@ -64,17 +64,14 @@ fn main() {
         }
     };
 
-    let emoji_atlas: Option<EmojiAtlas> = match EmojiAtlas::from_path("app0:twemoji.png") {
+    let emoji_atlas: Option<EmojiAtlas> = match EmojiAtlas::from_path("app0:NotoColorEmoji.ttf") {
         Ok(a) => {
-            bsky_log::log!("emoji atlas: Twemoji loaded successfully");
+            bsky_log::log!("emoji font loaded successfully");
             Some(a)
         }
         Err(e) => {
-            bsky_log::log!("emoji atlas: Twemoji load failed ({e}); using rectangle fallback");
-            eprintln!(
-                "Twemoji atlas load failed ({e}); emoji will render as colored rectangles. \
-                 Run 'make push-emoji' to upload twemoji.png."
-            );
+            bsky_log::log!("emoji font load failed ({e}); using stable placeholder fallback");
+            eprintln!("Noto Color Emoji load failed ({e}); emoji will use placeholders");
             None
         }
     };
@@ -121,6 +118,9 @@ fn main() {
     let mut hints = HintOverlay::new();
 
     loop {
+        if let Some(atlas) = emoji_atlas.as_ref() {
+            atlas.service_pending(8);
+        }
         let pf = pad.poll();
         let tf = touch.poll();
         let ctx = UiCtx {

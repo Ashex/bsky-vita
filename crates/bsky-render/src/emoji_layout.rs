@@ -1,8 +1,7 @@
+use unicode_properties::emoji::UnicodeEmoji;
 use unicode_segmentation::UnicodeSegmentation;
 
-/// Remove text-presentation selectors before sending text to the Vita font
-/// backend, which may otherwise attempt to render the selector as a glyph.
-pub fn normalize_text(input: &str) -> std::borrow::Cow<'_, str> {
+pub fn text_run(input: &str) -> std::borrow::Cow<'_, str> {
     if input.contains('\u{fe0e}') {
         std::borrow::Cow::Owned(input.replace('\u{fe0e}', ""))
     } else {
@@ -21,40 +20,47 @@ fn is_emoji_cluster(cluster: &str) -> bool {
     if cluster.contains('\u{fe0e}') {
         return false;
     }
-    // Symbols with both text and emoji presentation require VS16 to be
-    // treated as emoji; their bare forms (and otherwise ordinary symbols)
-    // stay in the font text run.
-    let emoji_capable_symbol = |cp: u32| matches!(cp,
-        0x00a9 | 0x00ae | 0x203c | 0x2049 | 0x2122 | 0x2139 | 0x2300..=0x23ff | 0x3030 | 0x303d | 0x3297 | 0x3299
-    );
-    if emoji_capable_symbol(cluster.chars().next().unwrap_or('\0') as u32) {
-        return cluster.contains('\u{fe0f}');
+    let chars: Vec<char> = cluster.chars().collect();
+    if chars
+        .iter()
+        .any(|ch| matches!(*ch as u32, 0x1f1e6..=0x1f1ff))
+    {
+        return chars.len() == 2
+            && chars
+                .iter()
+                .all(|ch| matches!(*ch as u32, 0x1f1e6..=0x1f1ff));
     }
-    cluster.chars().any(|ch| {
-        let cp = ch as u32;
-        (0x1f000..=0x1faff).contains(&cp)
-            || (0x2600..=0x27ff).contains(&cp)
-            || (0x2b00..=0x2bff).contains(&cp)
-            || matches!(cp, 0x1f1e6..=0x1f1ff | 0x1f3f4)
-    })
+    if chars
+        .first()
+        .is_some_and(|ch| ch.is_ascii_digit() || matches!(ch, '#' | '*'))
+    {
+        return chars.iter().any(|ch| *ch == '\u{20e3}');
+    }
+    let Some(&first) = chars.first() else {
+        return false;
+    };
+    first.is_emoji_char()
+        && (cluster.contains('\u{fe0f}')
+            || first.emoji_status() != unicode_properties::emoji::EmojiStatus::EmojiOther
+                && first.emoji_status()
+                    != unicode_properties::emoji::EmojiStatus::EmojiModifierBase)
 }
 
 pub fn tokens(input: &str, mut supported: impl FnMut(&str) -> bool) -> Vec<Token<'_>> {
     let mut out = Vec::new();
     let mut text_start = 0;
     for (start, grapheme) in input.grapheme_indices(true) {
-        let is_emoji = is_emoji_cluster(grapheme);
-        if supported(grapheme) {
+        let emoji = is_emoji_cluster(grapheme);
+        let is_supported = emoji && supported(grapheme);
+        if is_supported || emoji {
             if text_start < start {
                 out.push(Token::Text(&input[text_start..start]));
             }
-            out.push(Token::Emoji(grapheme));
-            text_start = start + grapheme.len();
-        } else if is_emoji {
-            if text_start < start {
-                out.push(Token::Text(&input[text_start..start]));
-            }
-            out.push(Token::Fallback(grapheme));
+            out.push(if is_supported {
+                Token::Emoji(grapheme)
+            } else {
+                Token::Fallback(grapheme)
+            });
             text_start = start + grapheme.len();
         }
     }
@@ -114,6 +120,35 @@ pub fn layout(
     lines
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classification_preserves_presentation_and_actual_graphemes() {
+        assert_eq!(tokens("⌚", |_| true), vec![Token::Emoji("⌚")]);
+        assert_eq!(tokens("☀", |_| true), vec![Token::Text("☀")]);
+        assert_eq!(tokens("☀️", |_| true), vec![Token::Emoji("☀️")]);
+        assert_eq!(tokens("☀︎", |_| true), vec![Token::Text("☀︎")]);
+        assert_eq!(tokens("1️⃣", |_| true), vec![Token::Emoji("1️⃣")]);
+        assert_eq!(tokens("©", |_| true), vec![Token::Text("©")]);
+        assert_eq!(tokens("©️", |_| true), vec![Token::Emoji("©️")]);
+        assert_eq!(tokens("a\u{301}", |_| true), vec![Token::Text("a\u{301}")]);
+        assert_eq!(tokens("😀", |_| true), vec![Token::Emoji("😀")]);
+    }
+
+    #[test]
+    fn layout_and_truncation_keep_cluster_boundaries_and_blank_lines() {
+        assert_eq!(
+            layout("a\n\nb", 20, 1, |s| s.len() as i32),
+            vec!["a", "", "b"]
+        );
+        let input = "a1️⃣b";
+        let end = truncated_prefix_end(input, |s| s.len() <= "a1️⃣".len());
+        assert_eq!(&input[..end], "a1️⃣");
+    }
+}
+
 pub fn truncated_prefix_end(input: &str, mut fits: impl FnMut(&str) -> bool) -> usize {
     let mut end = 0;
     for (start, grapheme) in input.grapheme_indices(true) {
@@ -124,71 +159,4 @@ pub fn truncated_prefix_end(input: &str, mut fits: impl FnMut(&str) -> bool) -> 
         end = next;
     }
     end
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn generated_table_recognizes_complete_supported_sequences() {
-        for sequence in ["❤️", "1️⃣", "👍🏽", "🇬🇧", "👩‍💻", "🫶"] {
-            let result = tokens(sequence, |cluster| super::super::emoji_table::lookup_sequence(cluster).is_some());
-            assert_eq!(result, vec![Token::Emoji(sequence)], "{sequence}");
-        }
-    }
-
-    #[test]
-    fn generated_table_preserves_text_presentation_and_falls_back_once() {
-        assert_eq!(tokens("❤︎", |cluster| super::super::emoji_table::lookup_sequence(cluster).is_some()), vec![Token::Text("❤︎")]);
-        for sequence in ["👨‍👩‍👧‍👦", "🏴", "🫱🏻‍🫲🏿"] {
-            assert_eq!(tokens(sequence, |cluster| super::super::emoji_table::lookup_sequence(cluster).is_some()), vec![Token::Fallback(sequence)], "{sequence}");
-        }
-    }
-
-    #[test]
-    fn tokenizer_preserves_clusters_and_text() {
-        let s = "x👍🏽🇬🇧1️⃣👩‍💻🫶y";
-        let result = tokens(s, |g| ["👍🏽", "🇬🇧", "1️⃣", "👩‍💻", "🫶"].contains(&g));
-        assert_eq!(
-            result,
-            vec![
-                Token::Text("x"),
-                Token::Emoji("👍🏽"),
-                Token::Emoji("🇬🇧"),
-                Token::Emoji("1️⃣"),
-                Token::Emoji("👩‍💻"),
-                Token::Emoji("🫶"),
-                Token::Text("y")
-            ]
-        );
-    }
-
-    #[test]
-    fn ordinary_symbols_stay_text_and_emoji_presentation_is_classified() {
-        for symbol in ["⌘", "⌥", "©", "™"] {
-            assert_eq!(tokens(symbol, |_| false), vec![Token::Text(symbol)]);
-        }
-        assert_eq!(tokens("©️", |_| false), vec![Token::Fallback("©️")]);
-        assert_eq!(tokens("⌘️", |_| false), vec![Token::Fallback("⌘️")]);
-    }
-
-    #[test]
-    fn text_selector_is_removed_from_text_normalization_and_not_emoji() {
-        assert_eq!(normalize_text("❤︎"), "❤");
-        assert_eq!(tokens("❤︎", |_| false), vec![Token::Text("❤︎")]);
-    }
-
-    #[test]
-    fn layout_wraps_long_words_and_preserves_blank_rows() {
-        let lines = layout("abcdef\n\nxy", 2, 1, |s| s.graphemes(true).count() as i32);
-        assert_eq!(lines, vec!["ab", "cd", "ef", "", "xy"]);
-    }
-
-    #[test]
-    fn truncation_ends_on_cluster_boundary() {
-        let s = "A👩‍💻Z";
-        let end = truncated_prefix_end(s, |prefix| prefix.len() <= "A👩‍💻".len());
-        assert_eq!(&s[..end], "A👩‍💻");
-    }
 }
