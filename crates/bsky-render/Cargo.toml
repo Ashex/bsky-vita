@@ -15,6 +15,8 @@ bsky-log = { path = "../bsky-log" }
 # `image` + `svg` + `pic` features we don't need (we render to a flat
 # RGBA buffer via `to_vec()` directly).
 qrcode = { workspace = true }
+unicode-segmentation = { workspace = true }
+sha2 = { workspace = true }
 
 [target.'cfg(target_os = "vita")'.dependencies]
 vitasdk-sys = { workspace = true }
