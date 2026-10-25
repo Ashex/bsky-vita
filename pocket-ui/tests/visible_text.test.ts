@@ -2,6 +2,9 @@ import { describe, expect, it } from "bun:test";
 import {
   firstCandidates,
   layoutRows,
+  moveSelection,
+  reconcileSelection,
+  visibleWindow,
   parseMeasureRequest,
   validatePlacement,
   validateReply,
@@ -62,6 +65,21 @@ describe("visible text contract", () => {
       "three",
     ]);
     expect(h).toHaveLength(4);
+  });
+  it("keeps a selected URI anchored as history appends or replaces", () => {
+    const original = Array.from({ length: 200 }, (_, i) => ({ uri: `u${i}` }));
+    let selected: string | null = "u2";
+    selected = moveSelection(original, selected, 1);
+    for (let i = 200; i < 240; i++) original.push({ uri: `u${i}` });
+    expect(selected).toBe("u3");
+    expect(visibleWindow(original, selected).map((post) => post.uri)).toEqual(["u3", "u4", "u5"]);
+    const replaced = original.filter((post) => post.uri !== selected);
+    expect(reconcileSelection(original, replaced, selected)).toBe("u4");
+    expect(reconcileSelection(original, [], selected)).toBeNull();
+    expect(moveSelection(original, "u0", -1)).toBe("u0");
+    expect(moveSelection(original, "u239", 1)).toBe("u239");
+    expect(firstCandidates(original).map((post) => post.uri)).toEqual(["u0", "u1", "u2"]);
+    expect(visibleWindow(original, "u199").map((post) => post.uri)).toEqual(["u199", "u200", "u201"]);
   });
   it("counts UTF-8 by bytes for astral and combining text", () =>
     expect(utf8Bytes("🛰e\u0301\0")).toBe(8));

@@ -8,6 +8,179 @@ fn post(uri: &str, text: &str, state: &str) -> serde_json::Value {
 }
 
 #[test]
+fn advance_only_defers_raster_until_explicit_present_and_legacy_frame_still_presents() {
+    let mut guest = EmbeddedGuest::new(480, 272).expect("runtime initializes");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    guest
+        .advance_with_deadline(0, deadline)
+        .expect("guest advances");
+    // Raster access requires completion of the deferred presentation; verify
+    // that the host-facing phase transition itself succeeds in order.
+    guest
+        .present_with_deadline(deadline)
+        .expect("advanced state presents");
+    let _pixels = guest.pixels().expect("presented raster is readable");
+    // Existing public frame API remains the combined advance+present path.
+    guest.frame(0).expect("legacy frame advances and presents");
+}
+
+#[test]
+fn expired_deadline_between_advance_and_present_fails_closed() {
+    let mut guest = EmbeddedGuest::new(480, 272).expect("runtime initializes");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    guest
+        .advance_with_deadline(0, deadline)
+        .expect("guest advances within deadline");
+
+    let expired = std::time::Instant::now() - std::time::Duration::from_millis(1);
+    assert_eq!(
+        guest.present_with_deadline(expired).unwrap_err(),
+        "guest deadline exceeded"
+    );
+}
+
+#[test]
+fn packaged_guest_selects_and_measures_history_beyond_initial_window() {
+    let mut guest = EmbeddedGuest::new(480, 272).expect("runtime initializes");
+    // Use a maximum-size valid snapshot; the guest feed callback replaces history.
+    guest.eval("globalThis.__bskyHistoryRevision=1").unwrap();
+    {
+        let posts: Vec<_> = (0..200)
+            .map(|i| {
+                post(
+                    &format!("at://{i}"),
+                    if i % 7 == 0 { "" } else { "row" },
+                    if i % 7 == 0 { "blocked" } else { "clean" },
+                )
+            })
+            .collect();
+        let feed = serde_json::json!({"schema":1,"correlation":{"schema":1,"auth_generation":1,"mount_generation":1,"request_id":1,"source":"following","cursor":null},"posts":posts,"cursor":null});
+        guest
+            .deliver_feed_json_with_deadline(
+                &feed.to_string(),
+                std::time::Instant::now() + std::time::Duration::from_secs(2),
+            )
+            .unwrap();
+    }
+    let candidates = guest.eval_global("globalThis.__bskyVisibleCandidates(JSON.stringify({schema:1,stamp:{auth_generation:1,mount_generation:1,history_revision:1,layout_id:1},rows:[{uri:'at://0',width:440},{uri:'at://1',width:440},{uri:'at://2',width:440}]}))").unwrap();
+    assert!(!candidates.is_empty());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    // Establish the first selection, then verify UP clamps at the boundary.
+    for button in [0x0040, 0x0010] {
+        guest
+            .advance_with_deadline(button, deadline)
+            .expect("button press advances");
+        guest
+            .present_with_deadline(deadline)
+            .expect("pressed frame presents");
+        guest
+            .advance_with_deadline(0, deadline)
+            .expect("button release advances");
+        guest
+            .present_with_deadline(deadline)
+            .expect("released frame presents");
+    }
+    let raw_window = guest.eval_global("globalThis.__bskyVisibleWindow").unwrap();
+    let window: serde_json::Value = serde_json::from_str(&raw_window).unwrap();
+    assert_eq!(window["rows"][0]["uri"], "at://0");
+    // ButtonSnapshot carries one press pulse. A zero-button frame releases it,
+    // allowing the next press to produce another edge in the production input path.
+    for _ in 0..150 {
+        guest
+            .advance_with_deadline(0x0040, deadline)
+            .expect("DOWN press advances");
+        guest
+            .present_with_deadline(deadline)
+            .expect("DOWN frame presents");
+        guest
+            .advance_with_deadline(0, deadline)
+            .expect("button release advances");
+        guest
+            .present_with_deadline(deadline)
+            .expect("released frame presents");
+    }
+    let raw_window = guest.eval_global("globalThis.__bskyVisibleWindow").unwrap();
+    let window: serde_json::Value = serde_json::from_str(&raw_window).unwrap();
+    assert_eq!(window["rows"][0]["uri"], "at://150");
+    for _ in 0..2 {
+        guest
+            .advance_with_deadline(0x0040, deadline)
+            .expect("DOWN press advances");
+        guest
+            .present_with_deadline(deadline)
+            .expect("DOWN frame presents");
+        guest
+            .advance_with_deadline(0, deadline)
+            .expect("button release advances");
+        guest
+            .present_with_deadline(deadline)
+            .expect("released frame presents");
+    }
+    let raw_window = guest.eval_global("globalThis.__bskyVisibleWindow").unwrap();
+    let window: serde_json::Value = serde_json::from_str(&raw_window).unwrap();
+    assert_eq!(window["rows"][0]["uri"], "at://152");
+    guest
+        .advance_with_deadline(0x0010, deadline)
+        .expect("UP press advances");
+    guest
+        .present_with_deadline(deadline)
+        .expect("UP frame presents");
+    guest
+        .advance_with_deadline(0, deadline)
+        .expect("button release advances");
+    guest
+        .present_with_deadline(deadline)
+        .expect("released frame presents");
+    let raw_window = guest.eval_global("globalThis.__bskyVisibleWindow").unwrap();
+    let window: serde_json::Value = serde_json::from_str(&raw_window).unwrap();
+    assert_eq!(window["rows"][0]["uri"], "at://151");
+    let selected = window["rows"][0]["uri"].as_str().unwrap();
+    assert_eq!(selected, "at://151");
+    assert!(!candidates.is_empty(), "guest should find requested rows");
+    let raw_window = guest
+        .eval_global("globalThis.__bskyVisibleWindow || '[]'")
+        .unwrap();
+    let window: serde_json::Value = serde_json::from_str(&raw_window).unwrap();
+    assert_eq!(
+        window["rows"],
+        serde_json::json!([
+            {"uri":"at://151","width":440},
+            {"uri":"at://152","width":440},
+            {"uri":"at://153","width":440}
+        ])
+    );
+    // Appending/replacing retained history must preserve the selected URI.
+    let appended: Vec<_> = (0..200)
+        .map(|i| post(&format!("at://{i}"), "row", "clean"))
+        .collect();
+    let feed = serde_json::json!({"schema":1,"correlation":{"schema":1,"auth_generation":1,"mount_generation":1,"request_id":2,"source":"following","cursor":null},"posts":appended,"cursor":null});
+    guest
+        .deliver_feed_json_with_deadline(&feed.to_string(), deadline)
+        .unwrap();
+    let preserved = guest.eval_global("globalThis.__bskyVisibleWindow").unwrap();
+    let preserved: serde_json::Value = serde_json::from_str(&preserved).unwrap();
+    assert_eq!(preserved["rows"][0]["uri"], "at://151");
+    let replacement = vec![post("at://replacement", "new", "clean")];
+    let feed = serde_json::json!({"schema":1,"correlation":{"schema":1,"auth_generation":1,"mount_generation":1,"request_id":3,"source":"following","cursor":null},"posts":replacement,"cursor":null});
+    guest
+        .deliver_feed_json_with_deadline(&feed.to_string(), deadline)
+        .unwrap();
+    let reset_raw = guest.eval_global("globalThis.__bskyVisibleWindow").unwrap();
+    let reset: serde_json::Value = serde_json::from_str(&reset_raw).unwrap();
+    assert_eq!(reset["rows"][0]["uri"], "at://replacement");
+    guest
+        .eval_global("globalThis.__bskySetFeedError('temporary failure')")
+        .unwrap();
+    let _ = guest
+        .eval_global("globalThis.__bskyTakeFeedCommands()")
+        .unwrap();
+    let selection_after_error = guest.eval_global("globalThis.__bskyVisibleWindow").unwrap();
+    let selection_after_error: serde_json::Value =
+        serde_json::from_str(&selection_after_error).unwrap();
+    assert_eq!(selection_after_error, reset);
+}
+
+#[test]
 fn context_feed_rows_are_joined_into_layout_and_advance_body_and_row_positions() {
     let mut guest = EmbeddedGuest::new(480, 272).expect("runtime initializes");
     assert_eq!(guest.state(), GuestState::Active);

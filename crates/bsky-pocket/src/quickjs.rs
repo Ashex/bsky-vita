@@ -88,7 +88,7 @@ extern "C" {
         context: *mut c_void,
     ) -> i32;
     fn pocket_runtime_boot_deferred(runtime: *mut PocketRuntime) -> i32;
-    fn pocket_runtime_tick(runtime: *mut PocketRuntime) -> i32;
+    fn pocket_runtime_advance(runtime: *mut PocketRuntime) -> i32;
     fn pocket_runtime_present(runtime: *mut PocketRuntime) -> i32;
     fn pocket_runtime_complete_presentation(runtime: *mut PocketRuntime) -> i32;
 }
@@ -554,21 +554,40 @@ impl EmbeddedGuest {
         self.frame_with_deadline(buttons, Instant::now() + frame_budget())
     }
     pub fn frame_with_deadline(&mut self, buttons: u32, deadline: Instant) -> Result<(), String> {
-        self.frame_with_budget(buttons, remaining(deadline))
+        self.advance_with_deadline(buttons, deadline)?;
+        self.present_with_deadline(deadline)
     }
     pub fn frame_with_budget(&mut self, buttons: u32, budget: Duration) -> Result<(), String> {
+        self.advance_with_budget(buttons, budget)?;
+        self.present_with_budget(budget)
+    }
+    pub fn advance_with_deadline(&mut self, buttons: u32, deadline: Instant) -> Result<(), String> {
+        self.advance_with_budget(buttons, remaining(deadline))
+    }
+    pub fn advance_with_budget(&mut self, buttons: u32, budget: Duration) -> Result<(), String> {
         self.input.set_buttons(buttons);
         let runtime = self.runtime;
-        let result = self.bounded(budget, move || unsafe {
-            if pocket_runtime_tick(runtime) != POCKET_STATUS_OK {
-                return Err("runtime frame execution/presentation failed".into());
+        self.bounded(budget, move || unsafe {
+            if pocket_runtime_advance(runtime) != POCKET_STATUS_OK {
+                return Err("runtime frame execution failed".into());
+            }
+            Ok(())
+        })
+    }
+    pub fn present_with_deadline(&mut self, deadline: Instant) -> Result<(), String> {
+        self.present_with_budget(remaining(deadline))
+    }
+    pub fn present_with_budget(&mut self, budget: Duration) -> Result<(), String> {
+        let runtime = self.runtime;
+        self.bounded(budget, move || unsafe {
+            if pocket_runtime_present(runtime) != POCKET_STATUS_OK {
+                return Err("runtime frame presentation failed".into());
             }
             if pocket_runtime_complete_presentation(runtime) != POCKET_STATUS_OK {
                 return Err("runtime raster completion failed".into());
             }
             Ok(())
-        });
-        result
+        })
     }
     pub fn native_batch_with_deadline(
         &mut self,

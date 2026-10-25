@@ -1,3 +1,50 @@
+diff --git a/contracts/generated/pocket_runtime.h b/contracts/generated/pocket_runtime.h
+index d9b8df6f80c9b58d174c95c79e086f5225ba465f..ade37f8afcb4404c2f45e6774ef01299e9650344 100644
+--- a/contracts/generated/pocket_runtime.h
++++ b/contracts/generated/pocket_runtime.h
+@@ -626,8 +626,12 @@ int32_t pocket_runtime_present(pocket_runtime * runtime);
+ /* Complete in-flight DEFERRED frames: renderer wait, flush or display wait, retire. Returns zero when none is pending. A failed completion returns its error once and invalidates that display's damage history. Call before reading a presented buffer or releasing state a pending submission reads. */
+ int32_t pocket_runtime_complete_presentation(pocket_runtime * runtime);
+ 
++/* Advance one guest frame and present it. Existing callers retain combined frame behavior; use advance followed by present when native host work must run between phases. */
+ int32_t pocket_runtime_tick(pocket_runtime * runtime);
+ 
++/* Advance guest and core state without presenting. Call present after bounded host-side work; a second advance is rejected until presentation. */
++int32_t pocket_runtime_advance(pocket_runtime * runtime);
++
+ /* Returns 0 or 1 without executing the operation. Does not invalidate borrowed results. */
+ uint32_t pocket_runtime_supports_op(const pocket_runtime * runtime, uint16_t op);
+ 
+diff --git a/contracts/spec/runtime-abi.ts b/contracts/spec/runtime-abi.ts
+index c9e00440e4a99e7d1f1af5107771c2b710fd10d0..f0ce23b128474df01778e3275b3977888fbb2a55 100644
+--- a/contracts/spec/runtime-abi.ts
++++ b/contracts/spec/runtime-abi.ts
+@@ -82,7 +82,8 @@ export const RUNTIME_ABI_FUNCTIONS: readonly AbiFunction[] = [
+   { name: "pocket_runtime_boot_deferred", args: [runtime], result: "i32", doc: "Admit and evaluate the package without presenting it. The program calls pocket_runtime_present before the first tick, after its native scene or host overlay is ready." },
+   { name: "pocket_runtime_present", args: [runtime], result: "i32", doc: "Present the retained tree without running the guest: after boot_deferred, to retry a failed output, or to redraw it under a host overlay. A guest that failed keeps its last tree presentable; advancing it stays rejected." },
+   { name: "pocket_runtime_complete_presentation", args: [runtime], result: "i32", doc: "Complete in-flight DEFERRED frames: renderer wait, flush or display wait, retire. Returns zero when none is pending. A failed completion returns its error once and invalidates that display's damage history. Call before reading a presented buffer or releasing state a pending submission reads." },
+-  { name: "pocket_runtime_tick", args: [runtime], result: "i32" },
++  { name: "pocket_runtime_tick", args: [runtime], result: "i32", doc: "Advance one guest frame and present it. Existing callers retain combined frame behavior; use advance followed by present when native host work must run between phases." },
++  { name: "pocket_runtime_advance", args: [runtime], result: "i32", doc: "Advance guest and core state without presenting. Call present after bounded host-side work; a second advance is rejected until presentation." },
+   { name: "pocket_runtime_supports_op", args: [f("runtime", "*const PocketRuntime"), f("op", "u16")], result: "u32", doc: "Returns 0 or 1 without executing the operation. Does not invalidate borrowed results." },
+   { name: "pocket_runtime_op", args: [runtime, f("op", "u16"), f("args", "*const c_void"), f("length", "usize"), f("out", "*mut PocketResult")], result: "i32", doc: "Generated bindings use this operation dispatcher. out bytes expire at the next call on runtime." },
+   { name: "pocket_runtime_destroy", args: [runtime], result: "void" },
+diff --git a/engine/drivers/src/abi.rs b/engine/drivers/src/abi.rs
+index f6735457efd8b1471d1eb00ecdddb6196d623984..611f3207584cfcf1c5f753c21e1b5eb516b2b441 100644
+--- a/engine/drivers/src/abi.rs
++++ b/engine/drivers/src/abi.rs
+@@ -791,7 +791,10 @@ pub fn pocket_runtime_boot_deferred(runtime: *mut PocketRuntime) -> i32;
+ pub fn pocket_runtime_present(runtime: *mut PocketRuntime) -> i32;
+     /// Complete in-flight DEFERRED frames: renderer wait, flush or display wait, retire. Returns zero when none is pending. A failed completion returns its error once and invalidates that display's damage history. Call before reading a presented buffer or releasing state a pending submission reads.
+ pub fn pocket_runtime_complete_presentation(runtime: *mut PocketRuntime) -> i32;
+-    pub fn pocket_runtime_tick(runtime: *mut PocketRuntime) -> i32;
++    /// Advance one guest frame and present it. Existing callers retain combined frame behavior; use advance followed by present when native host work must run between phases.
++pub fn pocket_runtime_tick(runtime: *mut PocketRuntime) -> i32;
++    /// Advance guest and core state without presenting. Call present after bounded host-side work; a second advance is rejected until presentation.
++pub fn pocket_runtime_advance(runtime: *mut PocketRuntime) -> i32;
+     /// Returns 0 or 1 without executing the operation. Does not invalidate borrowed results.
+ pub fn pocket_runtime_supports_op(runtime: *const PocketRuntime, op: u16) -> u32;
+     /// Generated bindings use this operation dispatcher. out bytes expire at the next call on runtime.
 diff --git a/engine/guest-quickjs/include/pocket_guest_quickjs.h b/engine/guest-quickjs/include/pocket_guest_quickjs.h
 index 1966c64d92b64cfd3cbd452a4b5ed1afa6207035..32167173ca4f244033c8a39bb9754de8e62a81d5 100644
 --- a/engine/guest-quickjs/include/pocket_guest_quickjs.h
@@ -242,6 +289,23 @@ index 16f84d6a955543265ee2e3416d2165503075c8b0..0fe00d5b7a9492baf7b6776c005a3a3f
  pub mod raster;
  pub use pocket_drivers::abi;
  
+diff --git a/engine/runtime-cabi/src/runtime.rs b/engine/runtime-cabi/src/runtime.rs
+index 50d7eb875345d9e25c663db443a35a4eb930e4ae..fe62f83c7552297a3dee75b1fbff5deefc4768bb 100644
+--- a/engine/runtime-cabi/src/runtime.rs
++++ b/engine/runtime-cabi/src/runtime.rs
+@@ -311,6 +311,12 @@ pub unsafe extern "C" fn pocket_runtime_complete_presentation(runtime: *mut Pock
+ }
+ /// # Safety
+ /// runtime is a live instance on its owning thread.
++/// Advance one guest frame without presenting it, allowing hosts to perform
++/// bounded native layout work before publishing the matching raster.
++#[no_mangle]
++pub unsafe extern "C" fn pocket_runtime_advance(runtime: *mut PocketRuntime) -> i32 {
++    unsafe { modify(runtime, Runtime::advance) }
++}
+ #[no_mangle]
+ pub unsafe extern "C" fn pocket_runtime_tick(runtime: *mut PocketRuntime) -> i32 {
+     unsafe { modify(runtime, Runtime::tick) }
 diff --git a/programs/vita/src/instance.rs b/programs/vita/src/instance.rs
 index 69d5c276b8de3994aea3461c060f73ba6536bae2..7e7d1be5496e7a91ead6f04cf364889a53296ff9 100644
 --- a/programs/vita/src/instance.rs

@@ -3,6 +3,21 @@ use serde::{Deserialize, Serialize};
 pub const VISIBLE_SCHEMA: u8 = 1;
 pub const MAX_TEXT_BYTES: usize = 64 * 1024;
 pub const MAX_ROWS: usize = 3;
+
+/// Accept only a contiguous, ordered window from the current retained history.
+pub fn validate_window(history: &[String], proposed: &[String]) -> Option<Vec<String>> {
+    if proposed.is_empty() || proposed.len() > MAX_ROWS {
+        return None;
+    }
+    let start = history.iter().position(|uri| uri == &proposed[0])?;
+    let end = start.checked_add(proposed.len())?;
+    let expected = history.get(start..end)?;
+    expected
+        .iter()
+        .zip(proposed)
+        .all(|(uri, proposed)| uri == proposed)
+        .then(|| proposed.to_vec())
+}
 pub const MAX_ROW_BYTES: usize = 1024;
 pub const MAX_TOTAL_BYTES: usize = 3072;
 pub const MAX_MEASURE_CALLS_ROW: usize = 64;
@@ -321,6 +336,24 @@ mod tests {
             }],
         }
     }
+    #[test]
+    fn visible_window_requires_unique_ordered_contiguous_current_uris() {
+        let history = vec!["a".into(), "b".into(), "c".into(), "d".into()];
+        assert_eq!(
+            validate_window(&history, &["b".into(), "c".into()]),
+            Some(vec!["b".into(), "c".into()])
+        );
+        assert_eq!(validate_window(&history, &["d".into(), "x".into()]), None);
+        assert_eq!(validate_window(&history, &["b".into(), "a".into()]), None);
+        assert_eq!(validate_window(&history, &["b".into(), "b".into()]), None);
+        assert_eq!(validate_window(&history, &["missing".into()]), None);
+        assert_eq!(
+            validate_window(&history, &["a".into(), "b".into(), "c".into(), "d".into()]),
+            None
+        );
+        assert_eq!(validate_window(&history, &[]), None);
+    }
+
     #[test]
     fn protocol_rejects_unknown_oversized_stale_and_misaligned_messages() {
         let req = request();

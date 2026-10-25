@@ -208,6 +208,36 @@ export function validatePlacement(
     )
   );
 }
+export function visibleWindow<T extends { uri: string }>(
+  history: T[],
+  selected: string | null,
+): T[] {
+  if (!history.length) return [];
+  const selectedIndex = history.findIndex((post) => post.uri === selected);
+  const index = Math.max(0, selectedIndex);
+  const start = Math.min(index, Math.max(0, history.length - 3));
+  return history.slice(start, start + 3);
+}
+export function moveSelection(
+  history: { uri: string }[],
+  selected: string | null,
+  delta: -1 | 1,
+): string | null {
+  if (!history.length) return null;
+  const index = history.findIndex((post) => post.uri === selected);
+  return history[Math.max(0, Math.min(history.length - 1, (index < 0 ? 0 : index) + delta))]!.uri;
+}
+export function reconcileSelection(
+  previous: { uri: string }[],
+  next: { uri: string }[],
+  selected: string | null,
+): string | null {
+  if (!next.length) return null;
+  const retained = selected && next.some((post) => post.uri === selected);
+  if (retained) return selected;
+  const previousIndex = previous.findIndex((post) => post.uri === selected);
+  return next[Math.max(0, Math.min(previousIndex < 0 ? 0 : previousIndex, next.length - 1))]!.uri;
+}
 export function firstCandidates<T extends { uri: string }>(history: T[]): T[] {
-  return history.slice(0, 3);
+  return visibleWindow(history, history[0]?.uri ?? null);
 }

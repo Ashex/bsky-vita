@@ -117,17 +117,53 @@ impl PocketShell {
         font: &Font,
         deadline: std::time::Instant,
     ) -> Result<(), String> {
+        let mut delivered_feed = false;
         if let Some(delivery) = self.pending_delivery.take() {
             let json = serde_json::to_string(&delivery)
                 .map_err(|_| "feed delivery serialization failed")?;
+            {
+                let coordinator = self.coordinator.lock().unwrap();
+                self.guest.set_global_json(
+                    "__bskyAuthGeneration",
+                    &self.auth_generation.max(1).to_string(),
+                    deadline,
+                )?;
+                self.guest.set_global_json(
+                    "__bskyMountGeneration",
+                    &self.mount_generation.max(1).to_string(),
+                    deadline,
+                )?;
+                self.guest.set_global_json(
+                    "__bskyHistoryRevision",
+                    &coordinator.history_revision().max(1).to_string(),
+                    deadline,
+                )?;
+            }
             self.guest
                 .deliver_feed_json_with_deadline(&json, deadline)?;
+            delivered_feed = true;
         }
+        let mut delivered_status = false;
         if let Some(status) = self.pending_status.take() {
             self.guest.deliver_status_with_deadline(&status, deadline)?;
+            delivered_status = true;
         }
         if let Some(error) = self.coordinator.lock().unwrap().error().map(str::to_owned) {
             self.guest.deliver_status_with_deadline(&error, deadline)?;
+            delivered_status = true;
+        }
+        if delivered_status {
+            self.authorized_stamp = None;
+            self.framebuffer_texture = None;
+            self.native_batch
+                .commands
+                .retain(|command| !matches!(command, NativeCommand::Text { stamp: Some(_), .. }));
+        }
+        if pad.current & (buttons::UP | buttons::DOWN) != 0 {
+            self.authorized_stamp = None;
+            self.native_batch
+                .commands
+                .retain(|command| !matches!(command, NativeCommand::Text { stamp: Some(_), .. }));
         }
         if pad.just_pressed(buttons::CIRCLE) {
             let effects = self
@@ -138,11 +174,18 @@ impl PocketShell {
             self.accept_effects(effects);
         }
         self.guest
-            .frame_with_deadline(crate::pocket_input::guest_buttons(pad.current), deadline)?;
+            .advance_with_deadline(crate::pocket_input::guest_buttons(pad.current), deadline)?;
         self.native_batch = self.guest.native_batch_with_budget(
             deadline.saturating_duration_since(std::time::Instant::now()),
         )?;
 
+        if delivered_feed {
+            self.authorized_stamp = None;
+            self.framebuffer_texture = None;
+            self.native_batch
+                .commands
+                .retain(|command| !matches!(command, NativeCommand::Text { stamp: Some(_), .. }));
+        }
         self.run_visible_text(font, deadline)?;
         self.native_batch.validate(480, 272)?;
         self.authorized_stamp =
@@ -176,6 +219,13 @@ impl PocketShell {
                 self.texture_generation = image.generation;
             }
         }
+        if std::time::Instant::now() >= deadline {
+            self.authorized_stamp = None;
+            self.framebuffer_texture = None;
+            self.native_batch.commands.clear();
+            return Err("pocket frame deadline exceeded before presentation".into());
+        }
+        self.guest.present_with_deadline(deadline)?;
         let frame_pixels = self.guest.pixels()?;
         if let Some(old) = self.framebuffer_texture.take() {
             bsky_render::wait_rendering_done();
@@ -196,17 +246,63 @@ impl PocketShell {
             MeasureReply, MeasureRequest, MeasureResult, MeasureStatus, PlacementMessage, Stamp,
         };
         if std::time::Instant::now() >= deadline {
+            self.authorized_stamp = None;
+            self.framebuffer_texture = None;
+            self.native_batch
+                .commands
+                .retain(|c| !matches!(c, NativeCommand::Text { stamp: Some(_), .. }));
             return Ok(());
         }
         let (revision, rows) = {
             let coordinator = self.coordinator.lock().unwrap();
-            let rows: Vec<_> = coordinator
+            let history: Vec<String> = coordinator
                 .history()
                 .posts()
                 .iter()
-                .take(bsky_pocket::visible_text::MAX_ROWS)
-                .map(|post| bsky_pocket::visible_text::MeasureRow {
-                    uri: post.uri.clone(),
+                .map(|post| post.uri.clone())
+                .collect();
+            let _ = self.guest.set_global_json(
+                "__bskyAuthGeneration",
+                &self.auth_generation.max(1).to_string(),
+                deadline,
+            );
+            let _ = self.guest.set_global_json(
+                "__bskyMountGeneration",
+                &self.mount_generation.max(1).to_string(),
+                deadline,
+            );
+            let _ = self.guest.set_global_json(
+                "__bskyHistoryRevision",
+                &coordinator.history_revision().max(1).to_string(),
+                deadline,
+            );
+            let raw = self
+                .guest
+                .eval_global_with_deadline("globalThis.__bskyVisibleWindow || ''", deadline)
+                .unwrap_or_default();
+            let proposed: Option<MeasureRequest> = serde_json::from_str(&raw).ok();
+            let requested = proposed
+                .filter(|request| request.validate().is_ok())
+                .filter(|request| {
+                    request.stamp.auth_generation == self.auth_generation.max(1)
+                        && request.stamp.mount_generation == self.mount_generation.max(1)
+                        && request.stamp.history_revision == coordinator.history_revision().max(1)
+                })
+                .and_then(|request| {
+                    let uris: Vec<String> = request.rows.into_iter().map(|row| row.uri).collect();
+                    bsky_pocket::visible_text::validate_window(&history, &uris)
+                });
+            let rows = requested.unwrap_or_else(|| {
+                history
+                    .iter()
+                    .take(bsky_pocket::visible_text::MAX_ROWS)
+                    .cloned()
+                    .collect()
+            });
+            let rows: Vec<bsky_pocket::visible_text::MeasureRow> = rows
+                .iter()
+                .map(|uri| bsky_pocket::visible_text::MeasureRow {
+                    uri: uri.clone(),
                     width: 440,
                 })
                 .collect();
@@ -214,6 +310,7 @@ impl PocketShell {
         };
         if rows.is_empty() {
             self.authorized_stamp = None;
+            self.framebuffer_texture = None;
             self.native_batch
                 .commands
                 .retain(|c| !matches!(c, NativeCommand::Text { stamp: Some(_), .. }));
@@ -340,6 +437,14 @@ impl PocketShell {
             "globalThis.__bskyVisibleMeasured(JSON.stringify(globalThis.__bskyVisibleMeasurement))",
             deadline,
         )?;
+        if std::time::Instant::now() >= deadline {
+            self.authorized_stamp = None;
+            self.framebuffer_texture = None;
+            self.native_batch
+                .commands
+                .retain(|c| !matches!(c, NativeCommand::Text { stamp: Some(_), .. }));
+            return Ok(());
+        }
         let placed = self
             .guest
             .eval_global_with_deadline("globalThis.__bskyVisiblePlacement || ''", deadline)?;
@@ -357,10 +462,13 @@ impl PocketShell {
                 if std::time::Instant::now() >= deadline {
                     return Ok(());
                 }
+                let y = position.y + metrics.baseline_offset + line as u16 * metrics.line_height;
+                if y >= 272 {
+                    continue;
+                }
                 commands.push(NativeCommand::Text {
                     x: position.x as f32,
-                    y: (position.y + metrics.baseline_offset + line as u16 * metrics.line_height)
-                        as f32,
+                    y: y as f32,
                     scale: 0.75,
                     color: 0xffffffff,
                     text: text.clone(),

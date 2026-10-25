@@ -14,17 +14,23 @@ import {
 import {
   firstCandidates,
   layoutRows,
+  moveSelection,
+  reconcileSelection,
+  visibleWindow,
   parseMeasureRequest,
   validateReply,
   type MeasureReply,
   type MeasureRequest,
+  type Stamp,
 } from "./visible_text";
 import { For } from "solid-js";
 export function Timeline() {
   const [delivery, setDelivery] = createSignal<FeedDelivery | null>(null);
   const [error, setError] = createSignal("");
   const [layout, setLayout] = createSignal<ReturnType<typeof layoutRows>>([]);
+  const [selectedUri, setSelectedUri] = createSignal<string | null>(null);
   let active: MeasureRequest | null = null;
+  let currentStamp: Stamp | null = null;
   globalThis.__bskyTakeFeedCommands = () => JSON.stringify(takeFeedCommands());
   globalThis.__bskySetFeedError = (m) => setError(m.slice(0, 160));
   requestFeed("first_page");
@@ -35,9 +41,33 @@ export function Timeline() {
       return;
     }
     setError("");
+    const previous = delivery()?.posts ?? [];
+    const selection = reconcileSelection(previous, next.posts, selectedUri());
+    setSelectedUri(selection);
     setDelivery(next);
     setLayout([]);
+    currentStamp = null;
+    globalThis.__bskyVisibleWindow = "";
     globalThis.nativeBatch.commands = [];
+    if (selection) {
+      const rows = visibleWindow(next.posts, selection).map((post) => ({
+        uri: post.uri,
+        width: 440,
+      }));
+      const revision = Number(globalThis.__bskyHistoryRevision ?? 0);
+      if (Number.isSafeInteger(revision) && revision > 0) {
+        globalThis.__bskyVisibleWindow = JSON.stringify({
+          schema: 1,
+          stamp: {
+            auth_generation: Number(globalThis.__bskyAuthGeneration ?? 1),
+            mount_generation: Number(globalThis.__bskyMountGeneration ?? 1),
+            history_revision: revision,
+            layout_id: 1,
+          },
+          rows,
+        });
+      }
+    }
   };
   globalThis.__bskyVisibleCandidates = (raw) => {
     const req = parseMeasureRequest(raw);
@@ -47,6 +77,7 @@ export function Timeline() {
       history.find((post) => post.uri === row.uri),
     );
     if (candidate.some((p) => !p)) return "";
+    currentStamp = req.stamp;
     active = req;
     globalThis.__bskyVisiblePlacement = "";
     return JSON.stringify({
@@ -64,7 +95,14 @@ export function Timeline() {
     if (!active) return "";
     try {
       const reply = JSON.parse(raw) as MeasureReply;
-      if (!validateReply(reply, active)) {
+      const selection = JSON.parse(globalThis.__bskyVisibleWindow || "null") as { schema: number; stamp: Stamp; rows: { uri: string; width: number }[] } | null;
+      if (
+        !validateReply(reply, active) ||
+        (selection && selection.stamp.auth_generation === reply.stamp.auth_generation &&
+          selection.stamp.mount_generation === reply.stamp.mount_generation &&
+          selection.stamp.history_revision === reply.stamp.history_revision &&
+          selection.rows.some((row, index) => row.uri !== reply.rows[index]?.uri))
+      ) {
         active = null;
         return "";
       }
@@ -97,7 +135,21 @@ export function Timeline() {
     active = null;
     return "";
   };
-  const posts = () => firstCandidates(delivery()?.posts ?? []);
+  const posts = () => visibleWindow(delivery()?.posts ?? [], selectedUri());
+  const publishSelection = (delta: -1 | 1) => {
+    const history = delivery()?.posts ?? [];
+    const selected = moveSelection(history, selectedUri(), delta);
+    setSelectedUri(selected);
+    if (selected && currentStamp) {
+      const rows = visibleWindow(history, selected).map((post) => ({
+        uri: post.uri,
+        width: 440,
+      }));
+      globalThis.__bskyVisibleWindow = JSON.stringify({ schema: 1, stamp: currentStamp, rows });
+    }
+  };
+  const selectPrevious = () => publishSelection(-1);
+  const selectNext = () => publishSelection(1);
   const status = () =>
     error() ||
     (!delivery()
@@ -207,6 +259,8 @@ export function Timeline() {
           );
         }}
       </For>
+      <ActionHandler button={BTN.UP} onPress={selectPrevious} />
+      <ActionHandler button={BTN.DOWN} onPress={selectNext} />
       <ActionHandler
         button={BTN.CROSS}
         onPress={() =>
@@ -222,12 +276,17 @@ export function Timeline() {
       {delivery()?.cursor && (
         <Text class="text-xs text-sky-300">More posts available · Cross</Text>
       )}
+      <Text class="text-xs text-sky-300">Select · Up/Down</Text>
       <Text class="text-xs text-sky-300">Refresh · Triangle</Text>
       {error() && <Text class="text-xs text-sky-300">Retry · Cross</Text>}
     </View>
   );
 }
 declare global {
+  var __bskyVisibleWindow: string;
+  var __bskyAuthGeneration: number;
+  var __bskyMountGeneration: number;
+  var __bskyHistoryRevision: number;
   var __bskyVisibleCandidates: (json: string) => string;
   var __bskyVisibleMeasured: (json: string) => string;
   var __bskyVisiblePlacement: string;
