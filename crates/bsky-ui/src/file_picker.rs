@@ -116,9 +116,11 @@ impl FilePicker {
             Ok(mut es) => {
                 es.retain(|e| e.is_dir || is_image(&e.name));
                 es.sort_by(|a, b| {
-                    b.is_dir
-                        .cmp(&a.is_dir)
-                        .then_with(|| a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase()))
+                    b.is_dir.cmp(&a.is_dir).then_with(|| {
+                        a.name
+                            .to_ascii_lowercase()
+                            .cmp(&b.name.to_ascii_lowercase())
+                    })
                 });
                 self.entries = es;
                 self.error = None;
@@ -130,7 +132,9 @@ impl FilePicker {
         }
         self.cursor = 0;
         self.scroll_row = 0;
-        self.cell_btns = (0..self.entries.len()).map(|_| ButtonState::default()).collect();
+        self.cell_btns = (0..self.entries.len())
+            .map(|_| ButtonState::default())
+            .collect();
         self.thumbs.clear();
         self.loaded = true;
     }
@@ -144,11 +148,12 @@ impl FilePicker {
             return; // stale (we navigated away) or not ours
         }
         let state = match bytes {
-            Ok(b) => match crate::imgutil::decode_thumb(b, THUMB_AREA_W as u32, THUMB_AREA_H as u32)
-            {
-                Some(t) => ThumbState::Ready(t),
-                None => ThumbState::Failed,
-            },
+            Ok(b) => {
+                match crate::imgutil::decode_thumb(b, THUMB_AREA_W as u32, THUMB_AREA_H as u32) {
+                    Some(t) => ThumbState::Ready(t),
+                    None => ThumbState::Failed,
+                }
+            }
             Err(_) => ThumbState::Failed,
         };
         self.thumbs.insert(path.to_string(), state);
@@ -172,7 +177,13 @@ impl FilePicker {
         }
 
         // Opaque modal backdrop.
-        frame.fill_rect(0.0, 0.0, SCREEN_WIDTH as f32, SCREEN_HEIGHT as f32, theme::BACKGROUND);
+        frame.fill_rect(
+            0.0,
+            0.0,
+            SCREEN_WIDTH as f32,
+            SCREEN_HEIGHT as f32,
+            theme::BACKGROUND,
+        );
 
         // ── Shortcut chips ────────────────────────────────────────────
         let mut chip_x = MARGIN_X;
@@ -182,7 +193,11 @@ impl FilePicker {
             let cw = lw + 24;
             let rect = Rect::new(chip_x as f32, 8.0, cw as f32, 32.0);
             let active = self.path == *root;
-            let bg = if active { theme::ACCENT } else { theme::FIELD_BG };
+            let bg = if active {
+                theme::ACCENT
+            } else {
+                theme::FIELD_BG
+            };
             frame.fill_rect(rect.x, rect.y, rect.w, rect.h, bg);
             frame.draw_text(font, chip_x + 12, 30, theme::TEXT_PRIMARY, 0.9, label);
             if clean_tap(rect, &mut self.chip_btns[i], ctx) {
@@ -274,9 +289,21 @@ impl FilePicker {
 
         // ── Grid ──────────────────────────────────────────────────────
         if let Some(err) = &self.error {
-            frame.draw_text_centered(font, GRID_TOP + 60, theme::ERROR, 0.95, &format!("Can't open: {err}"));
+            frame.draw_text_centered(
+                font,
+                GRID_TOP + 60,
+                theme::ERROR,
+                0.95,
+                &format!("Can't open: {err}"),
+            );
         } else if self.entries.is_empty() {
-            frame.draw_text_centered(font, GRID_TOP + 60, theme::TEXT_MUTED, 0.95, "No images or folders here");
+            frame.draw_text_centered(
+                font,
+                GRID_TOP + 60,
+                theme::TEXT_MUTED,
+                0.95,
+                "No images or folders here",
+            );
         } else {
             let mut tap_idx: Option<usize> = None;
             for idx in 0..self.entries.len() {

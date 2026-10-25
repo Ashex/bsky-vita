@@ -101,7 +101,11 @@ impl Screen for ImageViewerScreen {
         // Top bar: page indicator + close hint.
         frame.fill_rect(0.0, 0.0, SCREEN_WIDTH as f32, BAR_H as f32, theme::FIELD_BG);
         let hint = if self.images.len() > 1 {
-            format!("{} / {}    O / X close    ← → switch", self.index + 1, self.images.len())
+            format!(
+                "{} / {}    O / X close    ← → switch",
+                self.index + 1,
+                self.images.len()
+            )
         } else {
             "O / X close".to_string()
         };
@@ -109,7 +113,13 @@ impl Screen for ImageViewerScreen {
 
         // Alt-text band.
         if band_h > 0 {
-            frame.fill_rect(0.0, img_bottom as f32, SCREEN_WIDTH as f32, band_h as f32, theme::FIELD_BG);
+            frame.fill_rect(
+                0.0,
+                img_bottom as f32,
+                SCREEN_WIDTH as f32,
+                band_h as f32,
+                theme::FIELD_BG,
+            );
             frame.draw_text_wrapped(
                 font,
                 12,
@@ -137,14 +147,10 @@ impl Screen for ImageViewerScreen {
         if ctx.touches.is_empty() {
             self.armed = true;
         }
-        let in_image =
-            self.armed && ctx.touches.iter().any(|t| t.y > BAR_H && t.y < img_bottom);
+        let in_image = self.armed && ctx.touches.iter().any(|t| t.y > BAR_H && t.y < img_bottom);
         let tapped = self.close_pressed_last && !in_image && ctx.touches.is_empty();
         self.close_pressed_last = in_image;
-        if tapped
-            || ctx.pad.just_pressed(buttons::CIRCLE)
-            || ctx.pad.just_pressed(buttons::CROSS)
-        {
+        if tapped || ctx.pad.just_pressed(buttons::CIRCLE) || ctx.pad.just_pressed(buttons::CROSS) {
             return ScreenAction::Pop;
         }
         ScreenAction::None

@@ -63,10 +63,12 @@ pub fn login_with_password(handle: &str, app_password: &str) -> Result<AuthClien
     let agent = AtpAgent::new(pds_client, store);
 
     // Step 3: createSession (the agent persists the result via the store).
-    block_on(agent.login(handle, app_password))
-        .map_err(|e| AuthError::Login(format!("{e}")))?;
+    block_on(agent.login(handle, app_password)).map_err(|e| AuthError::Login(format!("{e}")))?;
 
-    Ok(AuthClient { agent: AuthAgent::Password(agent), resolved })
+    Ok(AuthClient {
+        agent: AuthAgent::Password(agent),
+        resolved,
+    })
 }
 
 /// If `session.json` exists, build an agent and call `resume_session`
@@ -106,7 +108,10 @@ pub fn try_resume_existing_session() -> Result<Option<AuthClient>, AuthError> {
     let agent = AtpAgent::new(pds_client, store);
 
     match block_on(agent.resume_session(session)) {
-        Ok(()) => Ok(Some(AuthClient { agent: AuthAgent::Password(agent), resolved })),
+        Ok(()) => Ok(Some(AuthClient {
+            agent: AuthAgent::Password(agent),
+            resolved,
+        })),
         Err(e) => {
             // Refresh failed (or getSession bounced). Treat as no session;
             // the caller will route to LoginScreen. We deliberately don't

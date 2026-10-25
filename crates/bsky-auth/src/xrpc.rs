@@ -22,7 +22,10 @@ pub struct PdsClient {
 
 impl PdsClient {
     pub fn new(inner: Arc<VitaHttpClient>, base_uri: impl Into<String>) -> Self {
-        Self { inner, base_uri: Mutex::new(base_uri.into()) }
+        Self {
+            inner,
+            base_uri: Mutex::new(base_uri.into()),
+        }
     }
 
     pub fn set_base_uri(&self, uri: impl Into<String>) {
@@ -44,6 +47,9 @@ impl HttpClient for PdsClient {
 
 impl XrpcClient for PdsClient {
     fn base_uri(&self) -> String {
-        self.base_uri.lock().expect("base_uri mutex poisoned").clone()
+        self.base_uri
+            .lock()
+            .expect("base_uri mutex poisoned")
+            .clone()
     }
 }

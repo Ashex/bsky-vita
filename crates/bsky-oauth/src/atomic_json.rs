@@ -58,8 +58,16 @@ pub fn load_json_recovering<T: DeserializeOwned>(path: &Path) -> Option<T> {
 /// Both removals are attempted; returns the first error, if any.
 pub fn delete_json(path: &Path) -> std::io::Result<()> {
     let tmp = tmp_path(path);
-    let r_main = if path.exists() { std::fs::remove_file(path) } else { Ok(()) };
-    let r_tmp = if tmp.exists() { std::fs::remove_file(&tmp) } else { Ok(()) };
+    let r_main = if path.exists() {
+        std::fs::remove_file(path)
+    } else {
+        Ok(())
+    };
+    let r_tmp = if tmp.exists() {
+        std::fs::remove_file(&tmp)
+    } else {
+        Ok(())
+    };
     r_main.and(r_tmp)
 }
 
@@ -212,7 +220,10 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        assert!(!p.exists(), "stale-generation write must not resurrect the file");
+        assert!(
+            !p.exists(),
+            "stale-generation write must not resurrect the file"
+        );
         // A freshly-built store captures g1 → writes allowed again.
         with_session_write_gate::<()>(g1, || {
             write(&p, 3);

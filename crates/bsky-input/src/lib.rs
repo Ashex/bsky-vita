@@ -170,10 +170,8 @@ impl Touch {
             let mut info: sce::SceTouchPanelInfo = core::mem::zeroed();
             sce::sceTouchGetPanelInfo(0, &mut info);
 
-            let span_x =
-                (info.maxDispX as i32 - info.minDispX as i32).max(1);
-            let span_y =
-                (info.maxDispY as i32 - info.minDispY as i32).max(1);
+            let span_x = (info.maxDispX as i32 - info.minDispX as i32).max(1);
+            let span_y = (info.maxDispY as i32 - info.minDispY as i32).max(1);
 
             Self {
                 panel: TouchPanel {
@@ -199,10 +197,8 @@ impl Touch {
             let mut points = Vec::with_capacity(n);
             for i in 0..n {
                 let r = &data.report[i];
-                let x = (r.x as i32 - self.panel.min_disp_x as i32) * 960
-                    / self.panel.span_disp_x;
-                let y = (r.y as i32 - self.panel.min_disp_y as i32) * 544
-                    / self.panel.span_disp_y;
+                let x = (r.x as i32 - self.panel.min_disp_x as i32) * 960 / self.panel.span_disp_x;
+                let y = (r.y as i32 - self.panel.min_disp_y as i32) * 544 / self.panel.span_disp_y;
                 points.push(TouchPoint {
                     id: r.id,
                     x,

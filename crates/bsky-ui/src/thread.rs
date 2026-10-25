@@ -144,8 +144,12 @@ impl ThreadScreen {
 
     fn toggle_engagement(&mut self, ctx: &crate::widget::UiCtx, kind: EngagementKind) {
         let Some(worker) = ctx.worker else { return };
-        let ThreadState::Loaded { posts, .. } = &mut self.state else { return };
-        let Some(post) = posts.get_mut(self.selected_idx) else { return };
+        let ThreadState::Loaded { posts, .. } = &mut self.state else {
+            return;
+        };
+        let Some(post) = posts.get_mut(self.selected_idx) else {
+            return;
+        };
         timeline::toggle_engagement(post, worker, kind);
     }
 }
@@ -284,8 +288,7 @@ impl Screen for ThreadScreen {
             } else if row_top < view_top + SCROLL_MARGIN {
                 self.scroll_y = (row_top - SCROLL_MARGIN).max(0) as f32;
             } else if row_top + row_h > view_bottom - SCROLL_MARGIN {
-                self.scroll_y =
-                    (row_top + row_h + SCROLL_MARGIN - viewport_h).max(0) as f32;
+                self.scroll_y = (row_top + row_h + SCROLL_MARGIN - viewport_h).max(0) as f32;
             }
         }
         // Analog stick free-scroll.
@@ -339,9 +342,9 @@ impl Screen for ThreadScreen {
                             post.post.embed.as_ref(),
                             post.post.author.did.as_ref(),
                         ) {
-                            if let Some((ey, eh)) = crate::embeds::embed_rect(
-                                frame, font, post, y_probe, ctx.emoji,
-                            ) {
+                            if let Some((ey, eh)) =
+                                crate::embeds::embed_rect(frame, font, post, y_probe, ctx.emoji)
+                            {
                                 let er = Rect::new(
                                     TEXT_LEFT as f32,
                                     ey as f32,
@@ -357,9 +360,9 @@ impl Screen for ThreadScreen {
                         if let Some(quote_uri) =
                             crate::embeds::quote_uri_in_embed(post.post.embed.as_ref())
                         {
-                            if let Some((ey, eh)) = crate::embeds::embed_rect(
-                                frame, font, post, y_probe, ctx.emoji,
-                            ) {
+                            if let Some((ey, eh)) =
+                                crate::embeds::embed_rect(frame, font, post, y_probe, ctx.emoji)
+                            {
                                 let er = Rect::new(
                                     TEXT_LEFT as f32,
                                     ey as f32,
@@ -402,11 +405,13 @@ impl Screen for ThreadScreen {
                     )));
                 }
                 Some(ThreadTap::OpenVideo(target)) => {
-                    return ScreenAction::Push(Box::new(crate::video_player::VideoPlayerScreen::new(
-                        Arc::clone(&self.client),
-                        target.did,
-                        target.cid,
-                    )));
+                    return ScreenAction::Push(Box::new(
+                        crate::video_player::VideoPlayerScreen::new(
+                            Arc::clone(&self.client),
+                            target.did,
+                            target.cid,
+                        ),
+                    ));
                 }
                 Some(ThreadTap::OpenImage { images, index }) => {
                     return ScreenAction::Push(Box::new(
@@ -455,21 +460,13 @@ impl Screen for ThreadScreen {
             }
             ThreadState::Loaded { posts, main_idx } => {
                 let mut y = HEADER_H - self.scroll_y as i32;
-                for (i, (post, &row_h)) in
-                    posts.iter().zip(self.row_heights.iter()).enumerate()
-                {
+                for (i, (post, &row_h)) in posts.iter().zip(self.row_heights.iter()).enumerate() {
                     let row_bottom = y + row_h;
                     if row_bottom > HEADER_H && y < SCREEN_HEIGHT {
                         // Highlight the main post with an ACCENT bar
                         // wider than the regular selection bar.
                         if i == *main_idx {
-                            frame.fill_rect(
-                                0.0,
-                                y as f32,
-                                6.0,
-                                row_h as f32,
-                                theme::ACCENT,
-                            );
+                            frame.fill_rect(0.0, y as f32, 6.0, row_h as f32, theme::ACCENT);
                         }
                         draw_post_row(
                             frame,
@@ -507,7 +504,13 @@ impl Screen for ThreadScreen {
         }
 
         // Sticky header (drawn last to cover scrolled content).
-        frame.fill_rect(0.0, 0.0, SCREEN_WIDTH as f32, HEADER_H as f32, theme::FIELD_BG);
+        frame.fill_rect(
+            0.0,
+            0.0,
+            SCREEN_WIDTH as f32,
+            HEADER_H as f32,
+            theme::FIELD_BG,
+        );
         frame.draw_text_centered(font, 26, theme::TEXT_PRIMARY, 1.1, "Thread");
         frame.fill_rect(
             0.0,
@@ -519,7 +522,13 @@ impl Screen for ThreadScreen {
 
         // Delete confirm / error banner, just below the header.
         if self.delete_armed() {
-            frame.fill_rect(0.0, HEADER_H as f32, SCREEN_WIDTH as f32, 28.0, theme::ERROR);
+            frame.fill_rect(
+                0.0,
+                HEADER_H as f32,
+                SCREEN_WIDTH as f32,
+                28.0,
+                theme::ERROR,
+            );
             frame.draw_text(
                 font,
                 12,
@@ -529,7 +538,13 @@ impl Screen for ThreadScreen {
                 "Delete your post?  SQUARE confirm  ·  CIRCLE cancel",
             );
         } else if let Some(err) = &self.delete_error {
-            frame.fill_rect(0.0, HEADER_H as f32, SCREEN_WIDTH as f32, 28.0, theme::ERROR);
+            frame.fill_rect(
+                0.0,
+                HEADER_H as f32,
+                SCREEN_WIDTH as f32,
+                28.0,
+                theme::ERROR,
+            );
             frame.draw_text(
                 font,
                 12,
@@ -574,7 +589,10 @@ impl Screen for ThreadScreen {
                 // the lazy-measure loop re-runs).
                 self.row_heights.clear();
                 self.pending_scroll_to_main = true;
-                self.state = ThreadState::Loaded { posts: std::mem::take(&mut posts), main_idx };
+                self.state = ThreadState::Loaded {
+                    posts: std::mem::take(&mut posts),
+                    main_idx,
+                };
             }
             WorkResponse::Thread(Err(e)) => {
                 self.state = ThreadState::Error(e);

@@ -480,10 +480,7 @@ impl AudioOut {
                 self.channel_count = chunk.channel_count;
                 self.granularity = frame_count;
             }
-            sce::sceAudioOutOutput(
-                self.port,
-                chunk.samples.as_ptr() as *const _,
-            );
+            sce::sceAudioOutOutput(self.port, chunk.samples.as_ptr() as *const _);
         }
         #[cfg(not(target_os = "vita"))]
         {
@@ -526,8 +523,7 @@ unsafe extern "C" fn av_alloc(
     alignment: u32,
     size: u32,
 ) -> *mut core::ffi::c_void {
-    static ALLOC_COUNT: std::sync::atomic::AtomicU32 =
-        std::sync::atomic::AtomicU32::new(0);
+    static ALLOC_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let c = ALLOC_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     if c <= 5 || c % 50 == 0 {
         bsky_log::log!("video: av_alloc #{c} align={alignment} size={size}");
@@ -594,8 +590,7 @@ unsafe extern "C" fn av_alloc_texture(
     alignment: u32,
     size: u32,
 ) -> *mut core::ffi::c_void {
-    static TEX_COUNT: std::sync::atomic::AtomicU32 =
-        std::sync::atomic::AtomicU32::new(0);
+    static TEX_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let c = TEX_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     bsky_log::log!("video: av_alloc_texture #{c} align={alignment} size={size}");
 
@@ -635,11 +630,7 @@ unsafe extern "C" fn av_alloc_texture(
         sce::sceKernelFreeMemBlock(uid);
         return core::ptr::null_mut();
     }
-    let map_r = sce::sceGxmMapMemory(
-        base,
-        total as u32,
-        sce::SCE_GXM_MEMORY_ATTRIB_RW,
-    );
+    let map_r = sce::sceGxmMapMemory(base, total as u32, sce::SCE_GXM_MEMORY_ATTRIB_RW);
     if map_r < 0 {
         bsky_log::log!("video: sceGxmMapMemory failed: {map_r:#x}");
         sce::sceKernelFreeMemBlock(uid);
@@ -650,10 +641,7 @@ unsafe extern "C" fn av_alloc_texture(
 }
 
 #[cfg(target_os = "vita")]
-unsafe extern "C" fn av_free_texture(
-    _user: *mut core::ffi::c_void,
-    ptr: *mut core::ffi::c_void,
-) {
+unsafe extern "C" fn av_free_texture(_user: *mut core::ffi::c_void, ptr: *mut core::ffi::c_void) {
     if ptr.is_null() {
         return;
     }
@@ -755,18 +743,14 @@ unsafe extern "C" fn av_file_read(
     // sceAvPlayer reads concurrently from its demuxer + decoder
     // threads. Serialize the lseek + read pair so concurrent
     // callers don't clobber each other's seek.
-    let _g = state
-        .read_lock
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
+    let _g = state.read_lock.lock().unwrap_or_else(|p| p.into_inner());
     let off = sce::sceIoLseek(state.fd, position as i64, sce::SCE_SEEK_SET as i32);
     if off < 0 {
         bsky_log::log!("video: av_file_read lseek failed: {off:#x}");
         return -1;
     }
     let n = sce::sceIoRead(state.fd, buffer as *mut _, length);
-    static READ_COUNT: std::sync::atomic::AtomicU32 =
-        std::sync::atomic::AtomicU32::new(0);
+    static READ_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let c = READ_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     if c <= 8 || c % 50 == 0 {
         bsky_log::log!("video: av_file_read #{c} pos={position} len={length} -> {n}");

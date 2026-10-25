@@ -22,6 +22,14 @@
 
 use std::sync::Arc;
 
+mod action_dispatch;
+
+#[cfg(feature = "pocketjs-poc")]
+mod pocket;
+
+#[cfg(feature = "pocketjs-poc")]
+mod pocket_input;
+
 use bsky_auth::AuthClient;
 use bsky_input::{buttons, Pad, Touch};
 use bsky_render::{EmojiAtlas, Render, Texture, TextureCache};
@@ -29,7 +37,43 @@ use bsky_ui::{
     ConversationListScreen, HintOverlay, LoginScreen, NotificationsScreen, ProfileScreen, Screen,
     ScreenAction, SearchScreen, TimelineScreen, TopLevel, UiCtx,
 };
+#[cfg(feature = "pocketjs-poc")]
+use bsky_worker::WorkRequest;
 use bsky_worker::{WorkResponse, Worker};
+
+#[cfg(feature = "pocketjs-poc")]
+fn run_pocket_effects(
+    effects: Vec<bsky_feed::FeedEffect>,
+    worker: Option<&Worker>,
+    mut shell: Option<&mut pocket::PocketShell>,
+) {
+    for effect in effects {
+        match effect {
+            bsky_feed::FeedEffect::FetchPage(correlation) => {
+                if let Some(worker) = worker {
+                    worker.send(WorkRequest::FetchFeedCorrelated {
+                        source: bsky_worker::FeedSource::Following,
+                        cursor: correlation.cursor.clone(),
+                        correlation: bsky_feed::FeedCorrelation {
+                            schema: correlation.schema,
+                            auth_generation: correlation.auth_generation,
+                            mount_generation: correlation.mount_generation,
+                            request_id: correlation.request_id,
+                            source: correlation.source,
+                            cursor: correlation.cursor,
+                        },
+                        deadline: None,
+                    });
+                }
+            }
+            view_effect => {
+                if let Some(shell) = shell.as_deref_mut() {
+                    shell.accept_effects(vec![view_effect]);
+                }
+            }
+        }
+    }
+}
 
 fn main() {
     bsky_log::init("ux0:/data/BSKY00001/run.log");
@@ -110,12 +154,19 @@ fn main() {
     // screens (TimelineScreen, ProfileScreen, …) when a `SwitchTab`
     // action lands on a tab without an existing instance in the stack.
     let mut auth_client: Option<Arc<AuthClient>> = None;
+    #[cfg(feature = "pocketjs-poc")]
+    let mut auth_generation: u64 = 0;
 
     let mut texture_cache = TextureCache::new(64);
 
     // Auto-hiding control-hints bar; shown on entry to each screen and
     // recalled with SELECT.
     let mut hints = HintOverlay::new();
+    #[cfg(feature = "pocketjs-poc")]
+    let mut pocket_shell: Option<pocket::PocketShell> = None;
+    #[cfg(feature = "pocketjs-poc")]
+    let pocket_coordinator =
+        std::sync::Arc::new(std::sync::Mutex::new(bsky_feed::FeedCoordinator::default()));
 
     loop {
         if let Some(atlas) = emoji_atlas.as_ref() {
@@ -135,11 +186,78 @@ fn main() {
 
         // Render + collect transition action. The Frame's Drop happens
         // when this block ends, which presents the buffer.
+        #[cfg(feature = "pocketjs-poc")]
+        if pocket_shell.is_none() && pf.just_pressed(buttons::START) && !ime.is_active() {
+            match pocket::PocketShell::new(pocket_coordinator.clone()) {
+                Ok(mut shell) => {
+                    let auth_effects = shell.bind_auth(auth_generation);
+                    shell.open_mount();
+                    let effects = shell.request_first();
+                    pocket_shell = Some(shell);
+                    run_pocket_effects(auth_effects, worker.as_ref(), pocket_shell.as_mut());
+                    run_pocket_effects(effects, worker.as_ref(), pocket_shell.as_mut());
+                }
+                Err(e) => bsky_log::log!("PocketJS startup failed: {e}"),
+            }
+        }
+        #[cfg(feature = "pocketjs-poc")]
+        let pocket_frame_deadline = std::time::Instant::now() + bsky_pocket::frame_budget();
+        #[cfg(feature = "pocketjs-poc")]
+        let auth_effects = pocket_shell
+            .as_mut()
+            .map(|shell| shell.bind_auth(auth_generation))
+            .unwrap_or_default();
+        #[cfg(feature = "pocketjs-poc")]
+        run_pocket_effects(auth_effects, worker.as_ref(), pocket_shell.as_mut());
+        #[cfg(feature = "pocketjs-poc")]
+        let pocket_active = pocket_shell.is_some();
+        #[cfg(feature = "pocketjs-poc")]
+        if let Some(shell) = pocket_shell.as_mut() {
+            if shell.wants_exit(&pf) {
+                pocket_coordinator
+                    .lock()
+                    .unwrap()
+                    .abandon_mount(shell.mount_generation());
+                bsky_render::wait_rendering_done();
+                pocket_shell = None;
+            } else if let Err(e) = shell.prepare_until(&pf, &font, pocket_frame_deadline) {
+                pocket_coordinator
+                    .lock()
+                    .unwrap()
+                    .abandon_mount(shell.mount_generation());
+                bsky_log::log!("PocketJS returned to native UI: {e}");
+                bsky_render::wait_rendering_done();
+                pocket_shell = None;
+            }
+        }
+        #[cfg(feature = "pocketjs-poc")]
+        let pocket_drawing = pocket_active && pocket_shell.is_some();
+        #[cfg(feature = "pocketjs-poc")]
+        if pocket_drawing {
+            if let Some(shell) = pocket_shell.as_mut() {
+                match shell.poll_guest_commands_until(pocket_frame_deadline) {
+                    Ok(effects) => run_pocket_effects(effects, worker.as_ref(), Some(shell)),
+                    Err(e) => bsky_log::log!("PocketJS command poll failed: {e}"),
+                }
+            }
+        }
+
         let action = {
             let top = screen_stack
                 .last_mut()
                 .expect("screen stack is never empty");
             let mut frame = render.begin_frame();
+            #[cfg(feature = "pocketjs-poc")]
+            let action = if pocket_drawing {
+                pocket_shell
+                    .as_ref()
+                    .expect("active PocketJS shell")
+                    .draw(&mut frame, &font);
+                ScreenAction::None
+            } else {
+                top.frame(&mut frame, &font, &ctx, &mut ime)
+            };
+            #[cfg(not(feature = "pocketjs-poc"))]
             let action = top.frame(&mut frame, &font, &ctx, &mut ime);
             // Control-hints bar, composited on top of the screen. Drawn
             // before pump_ime (which ends frame drawing) and skipped while
@@ -148,7 +266,7 @@ fn main() {
             if pf.just_pressed(buttons::SELECT) {
                 hints.toggle();
             }
-            if !ime.is_active() {
+            if !ime.is_active() && !cfg!(feature = "pocketjs-poc") {
                 let hint_list = top.control_hints();
                 hints.draw(&mut frame, &font, &hint_list, top.top_level().is_some());
             }
@@ -170,6 +288,8 @@ fn main() {
         // Set when a worker response shows the session's tokens are dead
         // (expired/revoked) → fall back to login after the drain.
         let mut session_dead = false;
+        #[cfg(feature = "pocketjs-poc")]
+        let frame_auth_generation = auth_generation;
         if let Some(w) = worker.as_ref() {
             while let Some(resp) = w.try_recv() {
                 let resp = if let WorkResponse::Image { url, bytes: Ok(b) } = &resp {
@@ -216,6 +336,34 @@ fn main() {
                     resp
                 };
                 let dead = resp.auth_failed();
+                #[cfg(feature = "pocketjs-poc")]
+                let dead = match &resp {
+                    WorkResponse::FeedPageCorrelated { correlation, .. } => {
+                        dead && correlation.auth_generation == frame_auth_generation
+                    }
+                    _ => dead,
+                };
+                #[cfg(feature = "pocketjs-poc")]
+                if let WorkResponse::FeedPageCorrelated { correlation, batch } = &resp {
+                    let converted = bsky_feed::FeedCorrelation {
+                        schema: correlation.schema,
+                        auth_generation: correlation.auth_generation,
+                        mount_generation: correlation.mount_generation,
+                        request_id: correlation.request_id,
+                        source: correlation.source.clone(),
+                        cursor: correlation.cursor.clone(),
+                    };
+                    let result = batch.clone();
+                    let effects = pocket_coordinator.lock().unwrap().handle(
+                        bsky_feed::FeedEvent::Completed {
+                            correlation: converted,
+                            result,
+                        },
+                    );
+                    if correlation.auth_generation == auth_generation {
+                        run_pocket_effects(effects, worker.as_ref(), pocket_shell.as_mut());
+                    }
+                }
                 if let Some(top) = screen_stack.last_mut() {
                     top.handle_worker_response(resp);
                 }
@@ -227,32 +375,80 @@ fn main() {
             }
         }
 
-        // Any screen change re-shows the hint bar on the new page.
-        if !matches!(action, ScreenAction::None) {
-            hints.show();
+        // An auth failure from this frame's session must win over an
+        // AuthComplete action produced by the same presentation.
+        #[cfg(feature = "pocketjs-poc")]
+        if session_dead {
+            auth_generation = auth_generation.wrapping_add(1).max(1);
+            let effects = pocket_coordinator
+                .lock()
+                .unwrap()
+                .auth_changed(auth_generation);
+            run_pocket_effects(effects, worker.as_ref(), pocket_shell.as_mut());
+            pocket_shell = None;
+            teardown_to_login(&mut worker, &mut auth_client, &mut screen_stack);
         }
-        match action {
-            ScreenAction::None => {}
-            ScreenAction::Push(next) => {
-                screen_stack.push(next);
+
+        // A failed session invalidates any screen action produced before the
+        // worker response was drained. In particular, do not let a stale
+        // AuthComplete reinstall the session after teardown. Exit/navigation
+        // actions are suppressed too; the existing loop exit behavior is
+        // unchanged because ScreenAction has no exit variant.
+        if action_dispatch::allowed(
+            session_dead,
+            if matches!(action, ScreenAction::AuthComplete { .. }) {
+                action_dispatch::ActionKind::AuthComplete
+            } else {
+                action_dispatch::ActionKind::Other
+            },
+        ) {
+            // Any screen change re-shows the hint bar on the new page.
+            if !matches!(action, ScreenAction::None) {
+                hints.show();
             }
-            ScreenAction::Pop => {
-                if screen_stack.len() > 1 {
-                    bsky_render::wait_rendering_done();
-                    screen_stack.pop();
+            match action {
+                ScreenAction::None => {}
+                ScreenAction::Push(next) => {
+                    screen_stack.push(next);
                 }
-            }
-            ScreenAction::SwitchTab(target) => {
-                handle_switch_tab(target, &mut screen_stack, auth_client.as_ref());
-            }
-            ScreenAction::AuthComplete { client, next } => {
-                worker = Some(Worker::spawn(Arc::clone(&client)));
-                auth_client = Some(client);
-                screen_stack.clear();
-                screen_stack.push(next);
-            }
-            ScreenAction::Logout => {
-                teardown_to_login(&mut worker, &mut auth_client, &mut screen_stack);
+                ScreenAction::Pop => {
+                    if screen_stack.len() > 1 {
+                        bsky_render::wait_rendering_done();
+                        screen_stack.pop();
+                    }
+                }
+                ScreenAction::SwitchTab(target) => {
+                    handle_switch_tab(target, &mut screen_stack, auth_client.as_ref());
+                }
+                ScreenAction::AuthComplete { client, next } => {
+                    #[cfg(feature = "pocketjs-poc")]
+                    {
+                        auth_generation = auth_generation.wrapping_add(1).max(1);
+                        let effects = pocket_coordinator
+                            .lock()
+                            .unwrap()
+                            .auth_changed(auth_generation);
+                        run_pocket_effects(effects, worker.as_ref(), pocket_shell.as_mut());
+                        pocket_shell = None;
+                    }
+                    worker = Some(Worker::spawn(Arc::clone(&client)));
+                    auth_client = Some(client);
+                    screen_stack.clear();
+                    screen_stack.push(next);
+                }
+                ScreenAction::Logout => {
+                    #[cfg(feature = "pocketjs-poc")]
+                    {
+                        auth_generation = auth_generation.wrapping_add(1).max(1);
+                        let effects = pocket_coordinator
+                            .lock()
+                            .unwrap()
+                            .auth_changed(auth_generation);
+                        run_pocket_effects(effects, worker.as_ref(), pocket_shell.as_mut());
+                        pocket_shell = None;
+                    }
+                    teardown_to_login(&mut worker, &mut auth_client, &mut screen_stack);
+                }
             }
         }
 
@@ -260,6 +456,7 @@ fn main() {
         // session and return to login. This is the recovery path for an
         // expired/unrefreshed session that would otherwise strand the user
         // on a broken screen. Same teardown as an explicit logout.
+        #[cfg(not(feature = "pocketjs-poc"))]
         if session_dead {
             teardown_to_login(&mut worker, &mut auth_client, &mut screen_stack);
         }

@@ -96,6 +96,40 @@ pub fn wait_rendering_done() {
 #[cfg(not(target_os = "vita"))]
 pub fn wait_rendering_done() {}
 
+#[cfg(target_os = "vita")]
+pub fn measure_native_text(font: &Font, scale: f32, text: &str) -> (i32, i32) {
+    let cstr = match CString::new(text) {
+        Ok(value) => value,
+        Err(_) => return (0, 0),
+    };
+    let mut width = 0;
+    let mut height = 0;
+    unsafe {
+        match font {
+            Font::Pgf(ptr) => ffi::vita2d_pgf_text_dimensions(
+                ptr.as_ptr(),
+                scale,
+                cstr.as_ptr(),
+                &mut width,
+                &mut height,
+            ),
+            Font::Ttf(ptr) => ffi::vita2d_font_text_dimensions(
+                ptr.as_ptr(),
+                (scale * BASE_SIZE_PX as f32).round().max(1.0) as c_uint,
+                cstr.as_ptr(),
+                &mut width,
+                &mut height,
+            ),
+        }
+    }
+    (width, height)
+}
+
+#[cfg(not(target_os = "vita"))]
+pub fn measure_native_text(_font: &Font, _scale: f32, text: &str) -> (i32, i32) {
+    (text.chars().count() as i32 * 8, 16)
+}
+
 /// Whether color video rendering is available on this console.
 ///
 /// Color playback (Phase 5.3.x.1) compiles a custom GXM YUV→RGB fragment
@@ -786,6 +820,52 @@ impl Texture {
         self.height
     }
 
+    /// Create an RGBA texture from checked raw pixels on the native device.
+    /// The caller must wait for outstanding GPU readers before replacing or
+    /// dropping a texture previously submitted for drawing.
+    pub fn from_rgba_pixels(width: u32, height: u32, pixels: &[u8]) -> Result<Self, RenderError> {
+        let expected = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|n| n.checked_mul(4))
+            .ok_or(RenderError::TextureLoad("RGBA dimensions overflow"))?;
+        if width == 0 || height == 0 || pixels.len() != expected {
+            return Err(RenderError::TextureLoad(
+                "RGBA pixel buffer has invalid dimensions",
+            ));
+        }
+        #[cfg(target_os = "vita")]
+        {
+            let ptr = unsafe {
+                ffi::vita2d_create_empty_texture_format(
+                    width,
+                    height,
+                    vitasdk_sys::SCE_GXM_TEXTURE_FORMAT_A8B8G8R8 as core::ffi::c_uint,
+                )
+            };
+            let texture = Self::wrap_raw(ptr, "RGBA")?;
+            let stride = unsafe { ffi::vita2d_texture_get_stride(texture.ptr.as_ptr()) as usize };
+            let data = unsafe { ffi::vita2d_texture_get_datap(texture.ptr.as_ptr()) as *mut u8 };
+            if data.is_null() || stride < width as usize * 4 {
+                return Err(RenderError::TextureLoad("RGBA texture storage is invalid"));
+            }
+            for row in 0..height as usize {
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        pixels.as_ptr().add(row * width as usize * 4),
+                        data.add(row * stride),
+                        width as usize * 4,
+                    );
+                }
+            }
+            Ok(texture)
+        }
+        #[cfg(not(target_os = "vita"))]
+        {
+            let _ = pixels;
+            Err(RenderError::NotOnVita)
+        }
+    }
+
     /// In-place mask the texture's alpha channel so pixels outside the
     /// inscribed circle become transparent. Used for avatars: lets us
     /// composite a circular avatar over arbitrary backgrounds (e.g. a
@@ -1391,13 +1471,12 @@ impl<'r> Frame<'r> {
         }
     }
 
-    /// Draw `text` at integer pixel position `(x, y)` (the y is the text
-    /// baseline). Returns the x-position immediately after the last glyph,
-    /// suitable for chaining sequential `draw_text` calls.
-    ///
-    /// Any embedded NUL bytes are stripped before passing to vita2d. UTF-8
-    /// strings render as PGF glyphs; characters outside the loaded language
-    /// pack render as the system tofu glyph.
+    /// Measure text using the same native font provider used by draw_text.
+    /// This adapter exposes existing behavior; it does not add shaping coverage.
+    pub fn measure_pocket_text(&self, font: &Font, scale: f32, text: &str) -> (i32, i32) {
+        self.measure_text(font, scale, text)
+    }
+
     pub fn draw_text(
         &mut self,
         font: &Font,
@@ -1591,7 +1670,25 @@ impl<'r> Frame<'r> {
         }
     }
 
-    /// Draw `tex` scaled by `(x_scale, y_scale)` with top-left at `(x, y)`.
+    /// Draw the native PocketJS software framebuffer at logical display size.
+    /// Draw text through the same native font provider exposed by measurement.
+    pub fn draw_pocket_text(
+        &mut self,
+        font: &Font,
+        x: i32,
+        y: i32,
+        color: Color,
+        scale: f32,
+        text: &str,
+    ) {
+        self.draw_text(font, x, y, color, scale, text);
+    }
+
+    pub fn draw_pocket_framebuffer(&mut self, tex: &Texture) {
+        self.draw_texture_scale(tex, 0.0, 0.0, 1.0, 1.0);
+    }
+
+    /// Draw `tex` scaled by `(x_scale, y_scale)` with top-left at `(x, y).
     pub fn draw_texture_scale(
         &mut self,
         tex: &Texture,
@@ -1724,8 +1821,10 @@ impl<'r> Frame<'r> {
         for token in emoji_layout::tokens(text, |g| atlas.lookup_sequence(g).is_some()) {
             match token {
                 emoji_layout::Token::Text(run) => {
-                    width += self.measure_text(font, scale, &emoji_layout::text_run(run)).0
-                },
+                    width += self
+                        .measure_text(font, scale, &emoji_layout::text_run(run))
+                        .0
+                }
                 emoji_layout::Token::Emoji(sequence) => {
                     width += atlas
                         .measure_sequence(sequence, scale)

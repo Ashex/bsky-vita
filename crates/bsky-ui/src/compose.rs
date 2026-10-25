@@ -255,8 +255,10 @@ impl ComposeScreen {
         }
         let cur = self.current;
         if let Some(i) = self.viewing {
-            if let Some(bytes) =
-                self.segments[cur].attachments.get(i).and_then(|a| a.bytes.as_ref())
+            if let Some(bytes) = self.segments[cur]
+                .attachments
+                .get(i)
+                .and_then(|a| a.bytes.as_ref())
             {
                 // CPU decode → small texture (never GPU-decode a local file).
                 self.full_tex = decode_thumb(
@@ -321,8 +323,9 @@ impl Screen for ComposeScreen {
             ImeState::Finished(s) => {
                 if self.editing_alt {
                     let cur = self.current;
-                    if let Some(a) =
-                        self.viewing.and_then(|i| self.segments[cur].attachments.get_mut(i))
+                    if let Some(a) = self
+                        .viewing
+                        .and_then(|i| self.segments[cur].attachments.get_mut(i))
                     {
                         a.alt = s;
                     }
@@ -414,7 +417,13 @@ impl Screen for ComposeScreen {
                 frame.draw_texture(tex, dx as f32, dy as f32);
             }
             // Top bar.
-            frame.fill_rect(0.0, 0.0, SCREEN_WIDTH as f32, FULLVIEW_BAR_H as f32, theme::FIELD_BG);
+            frame.fill_rect(
+                0.0,
+                0.0,
+                SCREEN_WIDTH as f32,
+                FULLVIEW_BAR_H as f32,
+                theme::FIELD_BG,
+            );
             frame.draw_text(font, 12, 21, theme::TEXT_PRIMARY, 0.9, "O / X  close");
             // Alt-text band + Edit button.
             let alt = self.segments[self.current]
@@ -422,19 +431,42 @@ impl Screen for ComposeScreen {
                 .get(vi)
                 .map(|a| a.alt.clone())
                 .unwrap_or_default();
-            frame.fill_rect(0.0, band_y as f32, SCREEN_WIDTH as f32, band_h as f32, theme::FIELD_BG);
+            frame.fill_rect(
+                0.0,
+                band_y as f32,
+                SCREEN_WIDTH as f32,
+                band_h as f32,
+                theme::FIELD_BG,
+            );
             let (alt_text, alt_color): (&str, _) = if alt.is_empty() {
                 ("No alt text", theme::TEXT_MUTED)
             } else {
                 (alt.as_str(), theme::TEXT_PRIMARY)
             };
-            frame.draw_text_wrapped(font, 12, band_y + 20, SCREEN_WIDTH - 160, alt_color, 0.8, alt_text);
+            frame.draw_text_wrapped(
+                font,
+                12,
+                band_y + 20,
+                SCREEN_WIDTH - 160,
+                alt_color,
+                0.8,
+                alt_text,
+            );
             let interactive = !ime.is_active();
-            let edit_label = if alt.is_empty() { "Add alt" } else { "Edit alt" };
+            let edit_label = if alt.is_empty() {
+                "Add alt"
+            } else {
+                "Edit alt"
+            };
             if button(
                 frame,
                 font,
-                Rect::new((SCREEN_WIDTH - 140) as f32, (band_y + 8) as f32, 130.0, 40.0),
+                Rect::new(
+                    (SCREEN_WIDTH - 140) as f32,
+                    (band_y + 8) as f32,
+                    130.0,
+                    40.0,
+                ),
                 edit_label,
                 &mut self.edit_alt_btn,
                 ctx,
@@ -521,7 +553,11 @@ impl Screen for ComposeScreen {
         // Post (right). "Post all" when it's a multi-segment thread.
         let post_rect = Rect::new(SCREEN_WIDTH as f32 - 108.0, 8.0, 100.0, 40.0);
         let can_post = self.can_post();
-        let post_label = if self.segments.len() > 1 { "Post all" } else { "Post" };
+        let post_label = if self.segments.len() > 1 {
+            "Post all"
+        } else {
+            "Post"
+        };
         let post_clicked = button(
             frame,
             font,
@@ -564,14 +600,7 @@ impl Screen for ComposeScreen {
         let mut content_top = header_h + 12;
         if let Some(handle) = self.reply_handle.as_deref() {
             let line = format!("Replying to @{handle}");
-            frame.draw_text(
-                font,
-                16,
-                content_top + 16,
-                theme::TEXT_MUTED,
-                0.9,
-                &line,
-            );
+            frame.draw_text(font, 16, content_top + 16, theme::TEXT_MUTED, 0.9, &line);
             content_top += 28;
         }
 
@@ -582,7 +611,15 @@ impl Screen for ComposeScreen {
             if nlen == 1 {
                 // Not a thread yet — a single "+ Thread" entry; the nav /
                 // add / delete controls stay hidden until threading starts.
-                if button(frame, font, Rect::new(16.0, by as f32, 134.0, 32.0), "+ Thread", &mut self.add_seg_btn, ctx, interactive) {
+                if button(
+                    frame,
+                    font,
+                    Rect::new(16.0, by as f32, 134.0, 32.0),
+                    "+ Thread",
+                    &mut self.add_seg_btn,
+                    ctx,
+                    interactive,
+                ) {
                     self.segments.push(Segment::default());
                     self.switch_segment(1);
                 }
@@ -598,17 +635,49 @@ impl Screen for ComposeScreen {
                 }
                 let label = format!("Post {} / {}", self.current + 1, nlen);
                 frame.draw_text(font, 16, by + 23, theme::TEXT_PRIMARY, 0.9, &label);
-                if button(frame, font, Rect::new(150.0, by as f32, 42.0, 32.0), "<", &mut self.prev_seg_btn, ctx, interactive && self.current > 0) {
+                if button(
+                    frame,
+                    font,
+                    Rect::new(150.0, by as f32, 42.0, 32.0),
+                    "<",
+                    &mut self.prev_seg_btn,
+                    ctx,
+                    interactive && self.current > 0,
+                ) {
                     self.switch_segment(self.current - 1);
                 }
-                if button(frame, font, Rect::new(198.0, by as f32, 42.0, 32.0), ">", &mut self.next_seg_btn, ctx, interactive && self.current + 1 < nlen) {
+                if button(
+                    frame,
+                    font,
+                    Rect::new(198.0, by as f32, 42.0, 32.0),
+                    ">",
+                    &mut self.next_seg_btn,
+                    ctx,
+                    interactive && self.current + 1 < nlen,
+                ) {
                     self.switch_segment(self.current + 1);
                 }
-                if button(frame, font, Rect::new(SCREEN_WIDTH as f32 - 232.0, by as f32, 112.0, 32.0), "+ Post", &mut self.add_seg_btn, ctx, interactive && nlen < MAX_SEGMENTS) {
+                if button(
+                    frame,
+                    font,
+                    Rect::new(SCREEN_WIDTH as f32 - 232.0, by as f32, 112.0, 32.0),
+                    "+ Post",
+                    &mut self.add_seg_btn,
+                    ctx,
+                    interactive && nlen < MAX_SEGMENTS,
+                ) {
                     self.segments.push(Segment::default());
                     self.switch_segment(self.segments.len() - 1);
                 }
-                if button(frame, font, Rect::new(SCREEN_WIDTH as f32 - 112.0, by as f32, 104.0, 32.0), "Del Post", &mut self.remove_seg_btn, ctx, interactive && nlen > 1) {
+                if button(
+                    frame,
+                    font,
+                    Rect::new(SCREEN_WIDTH as f32 - 112.0, by as f32, 104.0, 32.0),
+                    "Del Post",
+                    &mut self.remove_seg_btn,
+                    ctx,
+                    interactive && nlen > 1,
+                ) {
                     self.remove_current_segment();
                 }
             }
@@ -625,7 +694,11 @@ impl Screen for ComposeScreen {
         let counter_h = 32;
         // Strip is a thumbnail row when images are attached; a single
         // Add/Camera button row otherwise (no dead space).
-        let attach_h = if self.segments[cur].attachments.is_empty() { 44 } else { 94 };
+        let attach_h = if self.segments[cur].attachments.is_empty() {
+            44
+        } else {
+            94
+        };
         let area_h = SCREEN_HEIGHT - content_top - counter_h - 12 - attach_h - 8;
         let area_rect = Rect::new(
             12.0,
@@ -667,16 +740,15 @@ impl Screen for ComposeScreen {
             body,
             ctx.emoji,
         );
-        let area_clicked = button_invisible(
-            frame,
-            area_rect,
-            &mut self.text_area_btn,
-            ctx,
-            interactive,
-        );
+        let area_clicked =
+            button_invisible(frame, area_rect, &mut self.text_area_btn, ctx, interactive);
         if area_clicked {
             let _ = ime.open(
-                if self.reply_to.is_some() { "Reply" } else { "New post" },
+                if self.reply_to.is_some() {
+                    "Reply"
+                } else {
+                    "New post"
+                },
                 ImeMode::Default,
                 TextBoxMode::Default,
                 POST_LIMIT as u32,
@@ -697,21 +769,60 @@ impl Screen for ComposeScreen {
             if let Some(tex) = self.segments[cur].attachments[i].preview.as_ref() {
                 frame.draw_texture(tex, cell_x as f32, attach_y as f32);
             } else {
-                frame.fill_rect(cell_x as f32, attach_y as f32, tw as f32, th as f32, theme::FIELD_BG);
-                frame.draw_text(font, cell_x + 8, attach_y + th / 2, theme::TEXT_MUTED, 0.8, "…");
+                frame.fill_rect(
+                    cell_x as f32,
+                    attach_y as f32,
+                    tw as f32,
+                    th as f32,
+                    theme::FIELD_BG,
+                );
+                frame.draw_text(
+                    font,
+                    cell_x + 8,
+                    attach_y + th / 2,
+                    theme::TEXT_MUTED,
+                    0.8,
+                    "…",
+                );
             }
             // ALT badge.
             if !self.segments[cur].attachments[i].alt.is_empty() {
-                frame.fill_rect(cell_x as f32, (attach_y + th - 18) as f32, 36.0, 18.0, theme::ACCENT);
-                frame.draw_text(font, cell_x + 5, attach_y + th - 4, theme::TEXT_PRIMARY, 0.62, "ALT");
+                frame.fill_rect(
+                    cell_x as f32,
+                    (attach_y + th - 18) as f32,
+                    36.0,
+                    18.0,
+                    theme::ACCENT,
+                );
+                frame.draw_text(
+                    font,
+                    cell_x + 5,
+                    attach_y + th - 4,
+                    theme::TEXT_PRIMARY,
+                    0.62,
+                    "ALT",
+                );
             }
             // Remove (top-right).
             let rm_rect = Rect::new((cell_x + tw - 26) as f32, attach_y as f32, 26.0, 26.0);
-            if button(frame, font, rm_rect, "x", &mut self.remove_btns[i], ctx, interactive) {
+            if button(
+                frame,
+                font,
+                rm_rect,
+                "x",
+                &mut self.remove_btns[i],
+                ctx,
+                interactive,
+            ) {
                 request_remove = Some(i);
             }
             // Tap the thumbnail body (below the remove corner) → full view.
-            let body_rect = Rect::new(cell_x as f32, (attach_y + 26) as f32, tw as f32, (th - 26) as f32);
+            let body_rect = Rect::new(
+                cell_x as f32,
+                (attach_y + 26) as f32,
+                tw as f32,
+                (th - 26) as f32,
+            );
             if self.segments[cur].attachments[i].preview.is_some()
                 && button_invisible(frame, body_rect, &mut self.thumb_btns[i], ctx, interactive)
             {
@@ -722,10 +833,26 @@ impl Screen for ComposeScreen {
         if n_att < MAX_IMAGES {
             let bx = 12 + (n_att as i32) * STRIP_PITCH;
             let by = if n_att == 0 { attach_y } else { attach_y + 19 };
-            if button(frame, font, Rect::new(bx as f32, by as f32, 72.0, 40.0), "Add", &mut self.add_image_btn, ctx, interactive) {
+            if button(
+                frame,
+                font,
+                Rect::new(bx as f32, by as f32, 72.0, 40.0),
+                "Add",
+                &mut self.add_image_btn,
+                ctx,
+                interactive,
+            ) {
                 self.picker = Some(FilePicker::new());
             }
-            if button(frame, font, Rect::new((bx + 80) as f32, by as f32, 100.0, 40.0), "Camera", &mut self.camera_btn, ctx, interactive) {
+            if button(
+                frame,
+                font,
+                Rect::new((bx + 80) as f32, by as f32, 100.0, 40.0),
+                "Camera",
+                &mut self.camera_btn,
+                ctx,
+                interactive,
+            ) {
                 self.camera = Some(CameraCapture::new());
             }
         }
@@ -747,14 +874,7 @@ impl Screen for ComposeScreen {
         } else {
             theme::TEXT_MUTED
         };
-        frame.draw_text(
-            font,
-            16,
-            SCREEN_HEIGHT - 12,
-            count_color,
-            0.85,
-            &count_str,
-        );
+        frame.draw_text(font, 16, SCREEN_HEIGHT - 12, count_color, 0.85, &count_str);
         if let ComposeState::Submitting = &self.state {
             frame.draw_text(
                 font,

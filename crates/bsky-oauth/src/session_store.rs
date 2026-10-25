@@ -74,7 +74,11 @@ impl FileOAuthSessionStore {
         let path = path.into();
         let cached = Mutex::new(load_from_disk(&path));
         let generation = crate::atomic_json::current_session_generation();
-        Self { path, cached, generation }
+        Self {
+            path,
+            cached,
+            generation,
+        }
     }
 
     /// True iff a persisted session is currently loaded from disk.
@@ -127,10 +131,7 @@ fn load_from_disk(path: &PathBuf) -> Option<PersistedEnvelope> {
 impl Store<Did, Session> for FileOAuthSessionStore {
     type Error = OAuthSessionStoreError;
 
-    fn get(
-        &self,
-        key: &Did,
-    ) -> impl Future<Output = Result<Option<Session>, Self::Error>> + Send {
+    fn get(&self, key: &Did) -> impl Future<Output = Result<Option<Session>, Self::Error>> + Send {
         let snapshot = self
             .cached
             .lock()
@@ -152,7 +153,10 @@ impl Store<Did, Session> for FileOAuthSessionStore {
         key: Did,
         value: Session,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
-        let env = PersistedEnvelope { did: key, session: value };
+        let env = PersistedEnvelope {
+            did: key,
+            session: value,
+        };
         let result: Result<(), OAuthSessionStoreError> = (|| {
             *self
                 .cached

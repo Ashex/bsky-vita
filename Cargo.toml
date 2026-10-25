@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["app", "crates/*"]
-exclude = ["broker", "static-site"]
+exclude = ["broker", "static-site", "vendor/pocketjs"]
 
 [workspace.package]
 version = "1.0.0"

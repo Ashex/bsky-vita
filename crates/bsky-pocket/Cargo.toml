@@ -1,0 +1,20 @@
+[package]
+name = "bsky-pocket"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[build-dependencies]
+cc = "1"
+
+[dependencies]
+bsky-feed = { path = "../bsky-feed" }
+pocketjs-core = { path = "../../vendor/pocketjs/engine/core" }
+pocket-drivers = { path = "../../vendor/pocketjs/engine/drivers" }
+pocket-runtime-cabi = { path = "../../vendor/pocketjs/engine/runtime-cabi", default-features = false, features = ["std", "software-only"] }
+pocket-package = { path = "../../vendor/pocketjs/engine/package", default-features = false }
+pocket-runtime = { path = "../../vendor/pocketjs/engine/runtime" }
+pocket-raster = { path = "../../vendor/pocketjs/engine/raster" }
+serde = { workspace = true }
+serde_json = { workspace = true }

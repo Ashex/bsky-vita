@@ -130,8 +130,7 @@ pub fn spawn_broker_poll(state: String) -> BrokerPoll {
                 .build();
             let url = format!("{BROKER_POP_URL}?state={state}");
             bsky_log::log!("oauth: poll thread start, state={state}, url={url}");
-            let deadline =
-                std::time::Instant::now() + Duration::from_secs(POLL_DEADLINE_SECS);
+            let deadline = std::time::Instant::now() + Duration::from_secs(POLL_DEADLINE_SECS);
             let mut iter = 0u32;
 
             loop {
@@ -203,9 +202,7 @@ pub fn spawn_broker_poll(state: String) -> BrokerPoll {
                     }
                     Err(ureq::Error::Status(code, _)) => {
                         bsky_log::log!("oauth: poll iter={iter} unexpected HTTP {code}");
-                        let _ = tx.send(PollOutcome::Failed(format!(
-                            "broker HTTP {code}"
-                        )));
+                        let _ = tx.send(PollOutcome::Failed(format!("broker HTTP {code}")));
                         return;
                     }
                     Err(e) => {

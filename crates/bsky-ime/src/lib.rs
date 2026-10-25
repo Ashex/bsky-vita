@@ -199,10 +199,8 @@ impl Ime {
             // so the magic is per-instance (won't accept a copy/replay).
             // Without this, sceImeDialogInit returns 0x80020403
             // (SCE_COMMON_DIALOG_ERROR_INVALID_ARGUMENT).
-            let common_ptr =
-                (&mut param.commonParam) as *mut sce::SceCommonDialogParam;
-            param.commonParam.magic =
-                0xC0D1A109u32.wrapping_add(common_ptr as usize as u32);
+            let common_ptr = (&mut param.commonParam) as *mut sce::SceCommonDialogParam;
+            param.commonParam.magic = 0xC0D1A109u32.wrapping_add(common_ptr as usize as u32);
 
             let r = unsafe { sce::sceImeDialogInit(&param) };
             if r < 0 {

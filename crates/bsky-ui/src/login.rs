@@ -244,8 +244,15 @@ impl Screen for LoginScreen {
         match &self.state {
             LoginState::OAuthAwaiting { auth_url, qr, poll } => {
                 self.render_oauth_awaiting(frame, font, qr, auth_url);
-                let cancel_clicked =
-                    button(frame, font, CANCEL_BTN_RECT, "Cancel", &mut self.cancel_btn, ctx, true);
+                let cancel_clicked = button(
+                    frame,
+                    font,
+                    CANCEL_BTN_RECT,
+                    "Cancel",
+                    &mut self.cancel_btn,
+                    ctx,
+                    true,
+                );
                 let pad_cancel = ctx.pad.just_pressed(buttons::CIRCLE);
                 if cancel_clicked || pad_cancel {
                     // Tell the poll thread to stop hitting the broker right
@@ -270,8 +277,8 @@ impl Screen for LoginScreen {
         // Normal form layout (Idle / Authenticating / Error / CheckingSession / OAuthBeginning).
         self.render_form_header(frame, font);
 
-        let interactive = matches!(self.state, LoginState::Idle | LoginState::Error(_))
-            && !ime.is_active();
+        let interactive =
+            matches!(self.state, LoginState::Idle | LoginState::Error(_)) && !ime.is_active();
 
         // Handle field is shared between both modes.
         let h_clicked = text_field(
@@ -320,7 +327,12 @@ impl Screen for LoginScreen {
                     ctx,
                     interactive,
                 );
-                (false, "Sign in with Bluesky", l, "Use an app password instead")
+                (
+                    false,
+                    "Sign in with Bluesky",
+                    l,
+                    "Use an app password instead",
+                )
             }
         };
 
@@ -466,9 +478,7 @@ impl Screen for LoginScreen {
                 match try_resume_existing_session() {
                     Ok(Some(client)) => self.state = LoginState::Done(client),
                     Ok(None) => self.state = LoginState::Idle,
-                    Err(e) => {
-                        self.state = LoginState::Error(format!("resume failed: {e}"))
-                    }
+                    Err(e) => self.state = LoginState::Error(format!("resume failed: {e}")),
                 }
             }
             LoginState::Authenticating => {
@@ -493,8 +503,7 @@ impl Screen for LoginScreen {
                         let qr = match Texture::from_qr_string(&url, QR_MODULE_PX) {
                             Ok(t) => t,
                             Err(e) => {
-                                self.state =
-                                    LoginState::Error(format!("QR encode: {e}"));
+                                self.state = LoginState::Error(format!("QR encode: {e}"));
                                 return;
                             }
                         };
@@ -550,8 +559,7 @@ impl LoginScreen {
         match self.mode {
             Mode::AppPassword => {
                 if self.handle.value.trim().is_empty() || self.password.value.is_empty() {
-                    self.state =
-                        LoginState::Error("Handle and app password are required".into());
+                    self.state = LoginState::Error("Handle and app password are required".into());
                 } else {
                     self.state = LoginState::Authenticating;
                 }
@@ -575,13 +583,7 @@ impl LoginScreen {
         frame.draw_text_centered(font, 110, theme::TEXT_MUTED, 1.0, sub);
     }
 
-    fn render_oauth_awaiting(
-        &self,
-        frame: &mut Frame,
-        font: &Font,
-        qr: &Texture,
-        auth_url: &str,
-    ) {
+    fn render_oauth_awaiting(&self, frame: &mut Frame, font: &Font, qr: &Texture, auth_url: &str) {
         frame.draw_text_centered(font, 28, theme::TEXT_PRIMARY, 1.4, "Sign in on your phone");
         frame.draw_text_centered(
             font,

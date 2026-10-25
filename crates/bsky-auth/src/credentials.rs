@@ -17,15 +17,12 @@ pub struct Credentials {
 /// missing or malformed. We deliberately don't fall back silently — if the
 /// dev forgot to push credentials, fail loudly.
 pub fn load_credentials(path: &str) -> Result<Credentials, AuthError> {
-    let bytes = std::fs::read(path).map_err(|e| {
-        AuthError::Credentials(format!("could not read {path}: {e}"))
-    })?;
-    let text = std::str::from_utf8(&bytes).map_err(|e| {
-        AuthError::Credentials(format!("{path} is not utf-8: {e}"))
-    })?;
-    let creds: Credentials = toml::from_str(text).map_err(|e| {
-        AuthError::Credentials(format!("could not parse {path}: {e}"))
-    })?;
+    let bytes = std::fs::read(path)
+        .map_err(|e| AuthError::Credentials(format!("could not read {path}: {e}")))?;
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|e| AuthError::Credentials(format!("{path} is not utf-8: {e}")))?;
+    let creds: Credentials = toml::from_str(text)
+        .map_err(|e| AuthError::Credentials(format!("could not parse {path}: {e}")))?;
     if creds.handle.is_empty() || creds.app_password.is_empty() {
         return Err(AuthError::Credentials(
             "handle and app_password must both be non-empty".to_string(),

@@ -1474,6 +1474,7 @@ impl Screen for ProfileScreen {
             WorkResponse::FeedPage { source, batch } => {
                 self.handle_feed_page(source, batch);
             }
+            WorkResponse::FeedPageCorrelated { .. } => {}
             // Saved-feeds responses belong to TimelineScreen.
             WorkResponse::SavedFeeds(_) => {}
             // Image responses: cache is updated in main.rs; we just clear
@@ -2289,13 +2290,8 @@ fn draw_list_row(
     let creator_handle = format!("by @{}", item.creator.handle.as_str());
     let (handle_w, _) = frame.measure_text(font, 0.85, &creator_handle);
     let name_max_w = (SCREEN_WIDTH - PAD_X - text_x - handle_w - 12).max(0);
-    let display_name = frame.truncate_text_with_emoji(
-        font,
-        1.0,
-        item.name.as_str(),
-        name_max_w,
-        ctx.emoji,
-    );
+    let display_name =
+        frame.truncate_text_with_emoji(font, 1.0, item.name.as_str(), name_max_w, ctx.emoji);
     frame.draw_text_with_emoji(
         font,
         text_x,

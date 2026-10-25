@@ -35,26 +35,24 @@ use core::ptr;
 use std::sync::OnceLock;
 
 use vitasdk_sys::{
-    sceDmacMemcpy, sceGxmDraw, sceGxmProgramFindParameterByName, sceGxmProgramParameterGetResourceIndex,
-    sceGxmSetFragmentProgram, sceGxmSetFragmentTexture, sceGxmSetVertexProgram,
-    sceGxmSetVertexStream, sceGxmShaderPatcherCreateFragmentProgram,
+    sceDmacMemcpy, sceGxmDraw, sceGxmMapMemory, sceGxmProgramFindParameterByName,
+    sceGxmProgramParameterGetResourceIndex, sceGxmSetFragmentProgram, sceGxmSetFragmentTexture,
+    sceGxmSetVertexProgram, sceGxmSetVertexStream, sceGxmShaderPatcherCreateFragmentProgram,
     sceGxmShaderPatcherCreateVertexProgram, sceGxmShaderPatcherRegisterProgram,
-    sceGxmTextureSetMagFilter, sceGxmTextureSetMinFilter,
-    sceGxmTextureInitLinearStrided, sceGxmTextureSetUAddrMode, sceGxmTextureSetVAddrMode,
-    sceGxmMapMemory, sceGxmUnmapMemory,
+    sceGxmTextureInitLinearStrided, sceGxmTextureSetMagFilter, sceGxmTextureSetMinFilter,
+    sceGxmTextureSetUAddrMode, sceGxmTextureSetVAddrMode, sceGxmUnmapMemory,
     sceKernelAllocMemBlock, sceKernelFindMemBlockByAddr, sceKernelFreeMemBlock,
-    sceKernelGetMemBlockBase, sceKernelLoadStartModule,
-    sceShaccCgCompileProgram, sceShaccCgDestroyCompileOutput, sceShaccCgInitializeCallbackList,
+    sceKernelGetMemBlockBase, sceKernelLoadStartModule, sceShaccCgCompileProgram,
+    sceShaccCgDestroyCompileOutput, sceShaccCgInitializeCallbackList,
     sceShaccCgInitializeCompileOptions, sceShaccCgSetDefaultAllocator, sceSysmoduleLoadModule,
     SceGxmFragmentProgram, SceGxmTexture, SceGxmVertexAttribute, SceGxmVertexProgram,
     SceGxmVertexStream, SceShaccCgCallbackList, SceShaccCgCompileOptions, SceShaccCgSourceFile,
-    SceShaccCgSourceLocation,
-    SCE_GXM_ATTRIBUTE_FORMAT_F32, SCE_GXM_INDEX_FORMAT_U16, SCE_GXM_INDEX_SOURCE_INDEX_16BIT,
-    SCE_GXM_MEMORY_ATTRIB_READ, SCE_GXM_MULTISAMPLE_NONE,
+    SceShaccCgSourceLocation, SCE_GXM_ATTRIBUTE_FORMAT_F32, SCE_GXM_INDEX_FORMAT_U16,
+    SCE_GXM_INDEX_SOURCE_INDEX_16BIT, SCE_GXM_MEMORY_ATTRIB_READ, SCE_GXM_MULTISAMPLE_NONE,
     SCE_GXM_OUTPUT_REGISTER_FORMAT_UCHAR4, SCE_GXM_PRIMITIVE_TRIANGLE_STRIP,
     SCE_GXM_TEXTURE_ADDR_CLAMP, SCE_GXM_TEXTURE_FILTER_LINEAR, SCE_GXM_TEXTURE_FORMAT_U8_RRRR,
-    SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW, SCE_SHACCCG_PROFILE_FP,
-    SCE_SHACCCG_PROFILE_VP, SCE_SHACCCG_TRIVIAL, SCE_SYSMODULE_SHACCCG,
+    SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW, SCE_SHACCCG_PROFILE_FP, SCE_SHACCCG_PROFILE_VP,
+    SCE_SHACCCG_TRIVIAL, SCE_SYSMODULE_SHACCCG,
 };
 
 use crate::ffi;
@@ -89,9 +87,10 @@ unsafe extern "C" fn release_file_cb(
 /// (which mismatches our user-loaded SHACCCG ABI on this Vita —
 /// returns SCE_KERNEL_ERROR_MODULEMGR_OLD_LIB from shark_init). Returns
 /// the raw `SceGxmProgram` bytes copied out of SHACCCG's output buffer.
-unsafe fn compile_shader(source: &str, profile: vitasdk_sys::SceShaccCgTargetProfile)
-    -> Option<Vec<u8>>
-{
+unsafe fn compile_shader(
+    source: &str,
+    profile: vitasdk_sys::SceShaccCgTargetProfile,
+) -> Option<Vec<u8>> {
     use std::ffi::CString;
     let Ok(source_c) = CString::new(source) else {
         bsky_log::log!("video shader: source CString conv failed (interior NUL?)");
@@ -109,7 +108,10 @@ unsafe fn compile_shader(source: &str, profile: vitasdk_sys::SceShaccCgTargetPro
     let mut options: SceShaccCgCompileOptions = mem::zeroed();
     let r = sceShaccCgInitializeCompileOptions(&mut options);
     if r < 0 {
-        bsky_log::log!("video shader: InitializeCompileOptions = 0x{:08x}", r as u32);
+        bsky_log::log!(
+            "video shader: InitializeCompileOptions = 0x{:08x}",
+            r as u32
+        );
         return None;
     }
     options.mainSourceFile = filename.as_ptr();
@@ -139,7 +141,10 @@ unsafe fn compile_shader(source: &str, profile: vitasdk_sys::SceShaccCgTargetPro
                 let msg = core::ffi::CStr::from_ptr(d.message).to_string_lossy();
                 bsky_log::log!(
                     "video shader: diag[{}] level={} code={} msg={}",
-                    i, d.level, d.code, msg
+                    i,
+                    d.level,
+                    d.code,
+                    msg
                 );
             }
         }
@@ -148,15 +153,14 @@ unsafe fn compile_shader(source: &str, profile: vitasdk_sys::SceShaccCgTargetPro
     if out_ref.programData.is_null() || out_ref.programSize == 0 {
         bsky_log::log!(
             "video shader: empty program output (data={:p} size={})",
-            out_ref.programData, out_ref.programSize
+            out_ref.programData,
+            out_ref.programSize
         );
         sceShaccCgDestroyCompileOutput(output);
         return None;
     }
-    let blob: Vec<u8> = core::slice::from_raw_parts(
-        out_ref.programData,
-        out_ref.programSize as usize,
-    ).to_vec();
+    let blob: Vec<u8> =
+        core::slice::from_raw_parts(out_ref.programData, out_ref.programSize as usize).to_vec();
     sceShaccCgDestroyCompileOutput(output);
     Some(blob)
 }
@@ -224,20 +228,21 @@ impl PlaneTexture {
         let mut base: *mut c_void = ptr::null_mut();
         let r = unsafe { sceKernelGetMemBlockBase(uid, &mut base) };
         if r < 0 || base.is_null() {
-            unsafe { sceKernelFreeMemBlock(uid); }
+            unsafe {
+                sceKernelFreeMemBlock(uid);
+            }
             return Err("memblock base");
         }
         // Map the memblock into the GXM MMU. CDRAM does NOT auto-map
         // (testing without this call crashes the GPU).
-        let r = unsafe {
-            sceGxmMapMemory(base, size, SCE_GXM_MEMORY_ATTRIB_READ)
-        };
-        if r < 0 && (r as u32) != 0x8000_0019 /* already mapped */ {
-            bsky_log::log!(
-                "video shader: sceGxmMapMemory failed: 0x{:08x}",
-                r as u32
-            );
-            unsafe { sceKernelFreeMemBlock(uid); }
+        let r = unsafe { sceGxmMapMemory(base, size, SCE_GXM_MEMORY_ATTRIB_READ) };
+        if r < 0 && (r as u32) != 0x8000_0019
+        /* already mapped */
+        {
+            bsky_log::log!("video shader: sceGxmMapMemory failed: 0x{:08x}", r as u32);
+            unsafe {
+                sceKernelFreeMemBlock(uid);
+            }
             return Err("gxmMapMemory");
         }
         let mut gxm_tex: SceGxmTexture = unsafe { mem::zeroed() };
@@ -254,7 +259,10 @@ impl PlaneTexture {
         if r < 0 {
             bsky_log::log!(
                 "video shader: gxmTextureInitLinearStrided({}x{}, stride={}) failed: 0x{:08x}",
-                width, height, stride, r as u32
+                width,
+                height,
+                stride,
+                r as u32
             );
             unsafe {
                 sceGxmUnmapMemory(base);
@@ -341,10 +349,8 @@ impl YuvTexture {
         let ch = height / 2;
         let y = PlaneTexture::create(c"yuv-y", width, height)
             .map_err(crate::RenderError::TextureLoad)?;
-        let u = PlaneTexture::create(c"yuv-u", cw, ch)
-            .map_err(crate::RenderError::TextureLoad)?;
-        let v = PlaneTexture::create(c"yuv-v", cw, ch)
-            .map_err(crate::RenderError::TextureLoad)?;
+        let u = PlaneTexture::create(c"yuv-u", cw, ch).map_err(crate::RenderError::TextureLoad)?;
+        let v = PlaneTexture::create(c"yuv-v", cw, ch).map_err(crate::RenderError::TextureLoad)?;
         // Force shader pipeline init now (lazy in ensure_pipeline).
         // If it fails, the YuvTexture is useless — fail fast at create time.
         if ensure_pipeline().is_none() {
@@ -353,22 +359,25 @@ impl YuvTexture {
         // Pre-size the chroma scratch buffer for the NV12 plane.
         let chroma_bytes = (width * height / 2) as usize;
         let chroma_scratch = vec![0u8; chroma_bytes];
-        Ok(Self { y, u, v, chroma_scratch, width, height })
+        Ok(Self {
+            y,
+            u,
+            v,
+            chroma_scratch,
+            width,
+            height,
+        })
     }
 
-    pub fn upload(
-        &mut self,
-        y: &[u8],
-        y_pitch: usize,
-        uv: &[u8],
-        uv_pitch: usize,
-    ) {
+    pub fn upload(&mut self, y: &[u8], y_pitch: usize, uv: &[u8], uv_pitch: usize) {
         // Wait for the GPU to finish rendering whatever frame was last
         // submitted before we overwrite the texture data it samples
         // from. Without this, fast-moving video content can show
         // tearing as the CPU's mid-frame DMA races with the GPU's
         // ongoing texture fetches.
-        unsafe { ffi::vita2d_wait_rendering_done(); }
+        unsafe {
+            ffi::vita2d_wait_rendering_done();
+        }
         // Y: straight memcpy (unchanged).
         self.y.upload(y, y_pitch);
         // Step 1: hardware-DMA the entire NV12 chroma plane from
@@ -565,7 +574,9 @@ fn init_pipeline() -> Option<VideoShaderPipeline> {
                     bsky_log::log!(
                         "video shader: SHACCCG load failed (sysmodule=0x{:08x}, \
                          primary=0x{:08x}, alt=0x{:08x}); libshacccg.suprx not installed",
-                        r as u32, mod_id as u32, mod_id2 as u32
+                        r as u32,
+                        mod_id as u32,
+                        mod_id2 as u32
                     );
                     return None;
                 }
@@ -577,7 +588,10 @@ fn init_pipeline() -> Option<VideoShaderPipeline> {
         // malloc/free (same heap as the rest of the app).
         let r = sceShaccCgSetDefaultAllocator(Some(ffi::malloc), Some(ffi::free));
         if r < 0 {
-            bsky_log::log!("video shader: SetDefaultAllocator failed: 0x{:08x}", r as u32);
+            bsky_log::log!(
+                "video shader: SetDefaultAllocator failed: 0x{:08x}",
+                r as u32
+            );
             return None;
         }
 
@@ -632,7 +646,11 @@ fn capture_gxp(vert: &[u8], frag: &[u8]) {
     bsky_log::log!(
         "video shader: captured GXP (vert {}B ok={}, frag {}B ok={}) -> {} ; \
          FTP both into app/static/ to bundle",
-        vert.len(), ok_v, frag.len(), ok_f, VPATH
+        vert.len(),
+        ok_v,
+        frag.len(),
+        ok_f,
+        VPATH
     );
 }
 
@@ -659,25 +677,25 @@ fn build_pipeline_from_blobs(
         let mut vert_id: vitasdk_sys::SceGxmShaderPatcherId = ptr::null_mut();
         let r = sceGxmShaderPatcherRegisterProgram(patcher, vert_program_header, &mut vert_id);
         if r < 0 {
-            bsky_log::log!("video shader: patcher register vert failed: 0x{:08x}", r as u32);
+            bsky_log::log!(
+                "video shader: patcher register vert failed: 0x{:08x}",
+                r as u32
+            );
             return None;
         }
         let mut frag_id: vitasdk_sys::SceGxmShaderPatcherId = ptr::null_mut();
         let r = sceGxmShaderPatcherRegisterProgram(patcher, frag_program_header, &mut frag_id);
         if r < 0 {
-            bsky_log::log!("video shader: patcher register frag failed: 0x{:08x}", r as u32);
+            bsky_log::log!(
+                "video shader: patcher register frag failed: 0x{:08x}",
+                r as u32
+            );
             return None;
         }
 
         // Find the vertex attribute parameters (POSITION, TEXCOORD0).
-        let pos_param = sceGxmProgramFindParameterByName(
-            vert_program_header,
-            c"position".as_ptr(),
-        );
-        let tex_param = sceGxmProgramFindParameterByName(
-            vert_program_header,
-            c"texcoord".as_ptr(),
-        );
+        let pos_param = sceGxmProgramFindParameterByName(vert_program_header, c"position".as_ptr());
+        let tex_param = sceGxmProgramFindParameterByName(vert_program_header, c"texcoord".as_ptr());
         if pos_param.is_null() || tex_param.is_null() {
             bsky_log::log!(
                 "video shader: vertex program missing position/texcoord param: pos={:p} tex={:p}",
@@ -720,7 +738,10 @@ fn build_pipeline_from_blobs(
             &mut vert_program,
         );
         if r < 0 {
-            bsky_log::log!("video shader: createVertexProgram failed: 0x{:08x}", r as u32);
+            bsky_log::log!(
+                "video shader: createVertexProgram failed: 0x{:08x}",
+                r as u32
+            );
             return None;
         }
         let mut frag_program: *mut SceGxmFragmentProgram = ptr::null_mut();
@@ -734,7 +755,10 @@ fn build_pipeline_from_blobs(
             &mut frag_program,
         );
         if r < 0 {
-            bsky_log::log!("video shader: createFragmentProgram failed: 0x{:08x}", r as u32);
+            bsky_log::log!(
+                "video shader: createFragmentProgram failed: 0x{:08x}",
+                r as u32
+            );
             return None;
         }
 
@@ -748,9 +772,21 @@ fn build_pipeline_from_blobs(
         let y_param = sceGxmProgramFindParameterByName(frag_program_header, c"y_tex".as_ptr());
         let u_param = sceGxmProgramFindParameterByName(frag_program_header, c"u_tex".as_ptr());
         let v_param = sceGxmProgramFindParameterByName(frag_program_header, c"v_tex".as_ptr());
-        let y_tex_unit = if y_param.is_null() { 0 } else { sceGxmProgramParameterGetResourceIndex(y_param) };
-        let u_tex_unit = if u_param.is_null() { 1 } else { sceGxmProgramParameterGetResourceIndex(u_param) };
-        let v_tex_unit = if v_param.is_null() { 2 } else { sceGxmProgramParameterGetResourceIndex(v_param) };
+        let y_tex_unit = if y_param.is_null() {
+            0
+        } else {
+            sceGxmProgramParameterGetResourceIndex(y_param)
+        };
+        let u_tex_unit = if u_param.is_null() {
+            1
+        } else {
+            sceGxmProgramParameterGetResourceIndex(u_param)
+        };
+        let v_tex_unit = if v_param.is_null() {
+            2
+        } else {
+            sceGxmProgramParameterGetResourceIndex(v_param)
+        };
         bsky_log::log!(
             "video shader: pipeline ready (vert={}B frag={}B; tex units y={} u={} v={})",
             vert_blob.len(),
@@ -820,10 +856,30 @@ pub fn draw_quad(
         let y1 = to_ndc_y(dest_y + dest_h);
         // Triangle strip: TL, TR, BL, BR (vita2d's draw order).
         // UV (0,0) at TL, (1,1) at BR.
-        *vbuf.add(0) = VideoVert { x: x0, y: y0, u: 0.0, v: 0.0 };
-        *vbuf.add(1) = VideoVert { x: x1, y: y0, u: 1.0, v: 0.0 };
-        *vbuf.add(2) = VideoVert { x: x0, y: y1, u: 0.0, v: 1.0 };
-        *vbuf.add(3) = VideoVert { x: x1, y: y1, u: 1.0, v: 1.0 };
+        *vbuf.add(0) = VideoVert {
+            x: x0,
+            y: y0,
+            u: 0.0,
+            v: 0.0,
+        };
+        *vbuf.add(1) = VideoVert {
+            x: x1,
+            y: y0,
+            u: 1.0,
+            v: 0.0,
+        };
+        *vbuf.add(2) = VideoVert {
+            x: x0,
+            y: y1,
+            u: 0.0,
+            v: 1.0,
+        };
+        *vbuf.add(3) = VideoVert {
+            x: x1,
+            y: y1,
+            u: 1.0,
+            v: 1.0,
+        };
 
         sceGxmSetVertexProgram(ctx, pipeline.vert_program);
         sceGxmSetFragmentProgram(ctx, pipeline.frag_program);

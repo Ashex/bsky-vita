@@ -2,6 +2,13 @@
 /target/
 **/target/
 
+# Generated PocketJS guest package (recreated by `make prepare-pocket`)
+/pocket-ui/dist/timeline-probe.pocket
+
+# Local PocketJS dependencies and nested upstream checkout metadata
+/pocket-ui/node_modules/
+/vendor/pocketjs/
+
 # Vita build artifacts
 *.vpk
 *.velf

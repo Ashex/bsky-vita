@@ -33,23 +33,21 @@ use atrium_api::did_doc::DidDocument;
 use atrium_api::types::string::Did;
 use atrium_common::resolver::Resolver;
 use atrium_common::store::Store;
-use atrium_identity::did::{
-    CommonDidResolver, CommonDidResolverConfig, DEFAULT_PLC_DIRECTORY_URL,
-};
+use atrium_identity::did::{CommonDidResolver, CommonDidResolverConfig, DEFAULT_PLC_DIRECTORY_URL};
 use atrium_identity::handle::{AppViewHandleResolver, AppViewHandleResolverConfig};
 use atrium_identity::identity_resolver::ResolvedIdentity;
 use atrium_oauth::store::state::{InternalStateData, StateStore};
 use atrium_oauth::{
-    AtprotoClientMetadata, AuthMethod, AuthorizeOptions, CallbackParams, GrantType,
-    KnownScope, OAuthClient, OAuthClientConfig, OAuthResolverConfig, Scope,
+    AtprotoClientMetadata, AuthMethod, AuthorizeOptions, CallbackParams, GrantType, KnownScope,
+    OAuthClient, OAuthClientConfig, OAuthResolverConfig, Scope,
 };
 use bsky_net::VitaHttpClient;
 use futures::executor::block_on;
 
 use crate::session_store::{FileOAuthSessionStore, OAuthSessionStoreError};
 use crate::{
-    OAuthAgent, CLIENT_METADATA_URL, HANDLE_RESOLVER_URL, OAUTH_SESSION_PATH,
-    REDIRECT_URI_BROKER, REDIRECT_URI_QR,
+    OAuthAgent, CLIENT_METADATA_URL, HANDLE_RESOLVER_URL, OAUTH_SESSION_PATH, REDIRECT_URI_BROKER,
+    REDIRECT_URI_QR,
 };
 
 // Concrete generic params for `OAuthClient`. T = VitaHttpClient (not Arc) —
@@ -173,10 +171,7 @@ impl VitaOAuthClient {
         let client_metadata = AtprotoClientMetadata {
             client_id: CLIENT_METADATA_URL.to_string(),
             client_uri: Some("https://broker.davidlewis.xyz/".to_string()),
-            redirect_uris: vec![
-                REDIRECT_URI_BROKER.to_string(),
-                REDIRECT_URI_QR.to_string(),
-            ],
+            redirect_uris: vec![REDIRECT_URI_BROKER.to_string(), REDIRECT_URI_QR.to_string()],
             token_endpoint_auth_method: AuthMethod::None,
             grant_types: vec![GrantType::AuthorizationCode, GrantType::RefreshToken],
             scopes: vec![
@@ -234,10 +229,9 @@ impl VitaOAuthClient {
         self.state_store.clear_capture();
         let url = block_on(self.inner.authorize(handle_or_did, options))
             .map_err(|e| OAuthError::Authorize(format!("{e}")))?;
-        let state = self
-            .state_store
-            .last_captured()
-            .ok_or_else(|| OAuthError::Authorize("state was not captured (atrium-oauth API change?)".into()))?;
+        let state = self.state_store.last_captured().ok_or_else(|| {
+            OAuthError::Authorize("state was not captured (atrium-oauth API change?)".into())
+        })?;
         bsky_log::log!(
             "oauth: start_flow handle={} state={} url_len={}",
             handle_or_did,
@@ -313,8 +307,8 @@ pub fn try_resume_existing_oauth_session() -> Result<Option<OAuthLoginResult>, O
     drop(probe); // release the file handle / Mutex; new client opens its own.
 
     let client = VitaOAuthClient::new()?;
-    let session = block_on(client.inner.restore(&did))
-        .map_err(|e| OAuthError::Restore(format!("{e}")))?;
+    let session =
+        block_on(client.inner.restore(&did)).map_err(|e| OAuthError::Restore(format!("{e}")))?;
     let resolved = client.resolve_identity_for_did(&did)?;
     Ok(Some(OAuthLoginResult {
         agent: Agent::new(session),

@@ -79,8 +79,20 @@ impl HintOverlay {
             SCREEN_HEIGHT - HINT_BAR_H
         };
         // Opaque strip + a 1px top rule (matches the pill-row divider).
-        frame.fill_rect(0.0, bar_y as f32, SCREEN_WIDTH as f32, HINT_BAR_H as f32, theme::FIELD_BG);
-        frame.fill_rect(0.0, bar_y as f32, SCREEN_WIDTH as f32, 1.0, theme::TEXT_MUTED);
+        frame.fill_rect(
+            0.0,
+            bar_y as f32,
+            SCREEN_WIDTH as f32,
+            HINT_BAR_H as f32,
+            theme::FIELD_BG,
+        );
+        frame.fill_rect(
+            0.0,
+            bar_y as f32,
+            SCREEN_WIDTH as f32,
+            1.0,
+            theme::TEXT_MUTED,
+        );
 
         let scale = 0.8;
         let baseline = bar_y + HINT_BAR_H - 8;

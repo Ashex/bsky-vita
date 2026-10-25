@@ -33,6 +33,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
+name = "arrayvec"
+version = "0.7.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
+
+[[package]]
 name = "async-lock"
 version = "3.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -211,6 +217,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "bsky-feed"
+version = "1.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "bsky-ime"
 version = "1.0.0"
 dependencies = [
@@ -271,6 +285,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "bsky-pocket"
+version = "1.0.0"
+dependencies = [
+ "bsky-feed",
+ "cc",
+ "pocket-drivers",
+ "pocket-package",
+ "pocket-raster",
+ "pocket-runtime",
+ "pocket-runtime-cabi",
+ "pocketjs-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "bsky-render"
 version = "1.0.0"
 dependencies = [
@@ -317,6 +347,7 @@ version = "1.0.0"
 dependencies = [
  "atrium-api",
  "bsky-auth",
+ "bsky-feed",
  "bsky-ime",
  "bsky-input",
  "bsky-log",
@@ -324,6 +355,7 @@ dependencies = [
  "bsky-models",
  "bsky-net",
  "bsky-oauth",
+ "bsky-pocket",
  "bsky-render",
  "bsky-ui",
  "bsky-video",
@@ -341,6 +373,7 @@ dependencies = [
  "atrium-api",
  "atrium-xrpc",
  "bsky-auth",
+ "bsky-feed",
  "bsky-log",
  "bsky-net",
  "crossbeam-channel",
@@ -1253,6 +1286,105 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
+name = "pocket-draw-ops"
+version = "0.1.0"
+dependencies = [
+ "pocket-drivers",
+ "pocket-spec",
+]
+
+[[package]]
+name = "pocket-drivers"
+version = "0.1.0"
+dependencies = [
+ "pocket-spec",
+]
+
+[[package]]
+name = "pocket-glyph-pages"
+version = "0.1.0"
+dependencies = [
+ "pocket-drivers",
+ "pocket-spec",
+]
+
+[[package]]
+name = "pocket-media"
+version = "0.1.0"
+dependencies = [
+ "pocket-spec",
+]
+
+[[package]]
+name = "pocket-package"
+version = "0.1.0"
+dependencies = [
+ "pocket-drivers",
+ "pocket-spec",
+]
+
+[[package]]
+name = "pocket-present"
+version = "0.1.0"
+dependencies = [
+ "pocket-draw-ops",
+ "pocket-drivers",
+ "pocket-raster",
+ "pocket-spec",
+]
+
+[[package]]
+name = "pocket-raster"
+version = "0.1.0"
+dependencies = [
+ "pocket-draw-ops",
+ "pocket-drivers",
+ "pocket-spec",
+]
+
+[[package]]
+name = "pocket-runtime"
+version = "0.1.0"
+dependencies = [
+ "pocket-drivers",
+ "pocket-package",
+ "pocket-present",
+ "pocket-spec",
+ "pocketjs-core",
+]
+
+[[package]]
+name = "pocket-runtime-cabi"
+version = "0.1.0"
+dependencies = [
+ "pocket-draw-ops",
+ "pocket-drivers",
+ "pocket-glyph-pages",
+ "pocket-raster",
+ "pocket-runtime",
+ "pocket-spec",
+ "pocketjs-core",
+]
+
+[[package]]
+name = "pocket-spec"
+version = "0.1.0"
+
+[[package]]
+name = "pocketjs-core"
+version = "0.1.0"
+dependencies = [
+ "pocket-drivers",
+ "pocket-glyph-pages",
+ "pocket-media",
+ "pocket-package",
+ "pocket-present",
+ "pocket-raster",
+ "pocket-spec",
+ "taffy",
+]
+
+[[package]]
 name = "portable-atomic"
 version = "1.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1610,6 +1742,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
+name = "slotmap"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bdd58c3c93c3d278ca835519292445cb4b0d4dc59ccfdf7ceadaab3f8aeb4038"
+dependencies = [
+ "version_check",
+]
+
+[[package]]
 name = "smallvec"
 version = "1.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1647,6 +1788,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "taffy"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dfde4e2f8595f222ceaae1fb16b4963952e9b33e358869dc4cd6316b0e0790cd"
+dependencies = [
+ "arrayvec",
+ "serde",
+ "slotmap",
 ]
 
 [[package]]

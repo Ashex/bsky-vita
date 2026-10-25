@@ -22,9 +22,9 @@ pub mod video_player;
 pub mod widget;
 
 pub use compose::ComposeScreen;
-pub use hints::HintOverlay;
 pub use conversation::ConversationScreen;
 pub use conversations::ConversationListScreen;
+pub use hints::HintOverlay;
 pub use login::LoginScreen;
 pub use notifications::NotificationsScreen;
 pub use profile::ProfileScreen;

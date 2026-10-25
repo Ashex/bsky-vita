@@ -49,8 +49,7 @@ pub const BROKER_ORIGIN: &str = "https://broker.davidlewis.xyz";
 /// itself (folded in from a separate static host so the OAuth surface is
 /// a single deployable). The `client_id` field in the metadata MUST equal
 /// this URL — the AS treats it as the canonical identifier.
-pub const CLIENT_METADATA_URL: &str =
-    "https://broker.davidlewis.xyz/client_metadata.json";
+pub const CLIENT_METADATA_URL: &str = "https://broker.davidlewis.xyz/client_metadata.json";
 
 /// Broker pickup redirect URI. Declared in `client_metadata.json`.
 /// Must match exactly (byte-for-byte) per the OAuth spec. No trailing

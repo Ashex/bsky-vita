@@ -11,6 +11,197 @@
 
 use std::error::Error;
 use std::io::{Read, Write};
+use std::net::{SocketAddr, ToSocketAddrs};
+use std::sync::{mpsc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+thread_local! {
+    static REQUEST_DEADLINE: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+    #[cfg(test)]
+    static TEST_SEND_TIMEOUTS: std::cell::RefCell<Vec<Duration>> = const { std::cell::RefCell::new(Vec::new()) };
+    #[cfg(test)]
+    static TEST_BODY_BYTES: std::sync::atomic::AtomicUsize = const { std::sync::atomic::AtomicUsize::new(0) };
+}
+
+#[cfg(test)]
+static TEST_RESOLVER_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static TEST_NETWORK_LOCK: Mutex<()> = Mutex::new(());
+#[cfg(test)]
+static TEST_DNS_LOOKUP: OnceLock<
+    Mutex<Option<std::sync::Arc<dyn Fn(&str) -> std::io::Result<Vec<SocketAddr>> + Send + Sync>>>,
+> = OnceLock::new();
+
+/// Run work under one absolute XRPC request deadline on the current thread.
+/// Nested scopes preserve the earlier deadline and restore the prior scope.
+pub fn with_request_deadline<T>(duration: Duration, f: impl FnOnce() -> T) -> T {
+    with_absolute_request_deadline(Instant::now() + duration, f)
+}
+
+/// Run work under a caller-admitted absolute request deadline.
+pub fn with_absolute_request_deadline<T>(deadline: Instant, f: impl FnOnce() -> T) -> T {
+    REQUEST_DEADLINE.with(|slot| {
+        let previous = slot.get();
+        let requested = deadline;
+        slot.set(Some(previous.map_or(requested, |old| old.min(requested))));
+        struct Restore<'a>(&'a std::cell::Cell<Option<Instant>>, Option<Instant>);
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                self.0.set(self.1);
+            }
+        }
+        let _restore = Restore(slot, previous);
+        f()
+    })
+}
+
+const DNS_THREADS: usize = 2;
+const DNS_QUEUE: usize = 8;
+const DNS_CACHE: usize = 64;
+
+type DnsJob = (String, mpsc::SyncSender<Result<Vec<SocketAddr>, String>>);
+struct DnsPool {
+    sender: mpsc::SyncSender<DnsJob>,
+    cache: Mutex<Vec<(String, Vec<SocketAddr>)>>,
+}
+static DNS_POOL: OnceLock<DnsPool> = OnceLock::new();
+
+fn dns_pool() -> &'static DnsPool {
+    DNS_POOL.get_or_init(|| {
+        let (sender, receiver) = mpsc::sync_channel::<DnsJob>(DNS_QUEUE);
+        let receiver = std::sync::Arc::new(Mutex::new(receiver));
+        for _ in 0..DNS_THREADS {
+            let receiver = receiver.clone();
+            std::thread::spawn(move || loop {
+                let job = receiver.lock().unwrap().recv();
+                let Ok((hostport, reply)) = job else { break };
+                #[cfg(test)]
+                let injected = {
+                    TEST_RESOLVER_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    TEST_DNS_LOOKUP
+                        .get_or_init(|| Mutex::new(None))
+                        .lock()
+                        .unwrap()
+                        .clone()
+                };
+                #[cfg(test)]
+                let result = if let Some(lookup) = injected {
+                    lookup(&hostport)
+                } else {
+                    hostport
+                        .to_socket_addrs()
+                        .map(|addresses| addresses.collect::<Vec<_>>())
+                };
+                #[cfg(not(test))]
+                let result = hostport
+                    .to_socket_addrs()
+                    .map(|addresses| addresses.collect::<Vec<_>>());
+                let result = result.map_err(|error| error.to_string());
+                let _ = reply.send(result);
+            });
+        }
+        DnsPool {
+            sender,
+            cache: Mutex::new(Vec::new()),
+        }
+    })
+}
+
+const MAX_CONNECT_SLICE: Duration = Duration::from_secs(15);
+
+fn check_connect_budget(
+    deadline: Option<Instant>,
+    connect_allowance: Option<Duration>,
+) -> std::io::Result<()> {
+    if let Some(deadline) = deadline {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "request deadline exceeded")
+            })?;
+        if let Some(connect_allowance) = connect_allowance {
+            if remaining < connect_allowance {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "insufficient request time remaining for connection attempt",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn resolve_host(hostport: &str) -> std::io::Result<Vec<SocketAddr>> {
+    let deadline = REQUEST_DEADLINE.with(|slot| slot.get());
+    let connect_allowance = deadline.and_then(|deadline| {
+        deadline
+            .checked_duration_since(Instant::now())
+            .map(|remaining| (remaining / 2).min(MAX_CONNECT_SLICE))
+    });
+    check_connect_budget(deadline, connect_allowance)?;
+    let pool = dns_pool();
+    if let Some(addresses) = pool
+        .cache
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(key, _)| key == hostport)
+        .map(|(_, addresses)| addresses.clone())
+    {
+        check_connect_budget(deadline, connect_allowance)?;
+        return Ok(addresses);
+    }
+    let (reply, result) = mpsc::sync_channel(1);
+    pool.sender
+        .try_send((hostport.to_owned(), reply))
+        .map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::WouldBlock, "DNS resolver saturated")
+        })?;
+    let value = match deadline {
+        Some(deadline) => result.recv_timeout(
+            deadline
+                .checked_duration_since(Instant::now())
+                .filter(|d| !d.is_zero())
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "request deadline exceeded during DNS",
+                    )
+                })?,
+        ),
+        None => result
+            .recv()
+            .map_err(|_| mpsc::RecvTimeoutError::Disconnected),
+    }
+    .map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("DNS resolution unavailable: {error}"),
+        )
+    })?;
+    let addresses = value.map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?;
+    check_connect_budget(deadline, connect_allowance)?;
+    let mut cache = pool.cache.lock().unwrap();
+    if cache.len() >= DNS_CACHE {
+        cache.remove(0);
+    }
+    cache.push((hostport.to_owned(), addresses.clone()));
+    Ok(addresses)
+}
+
+fn remaining_request_time() -> Result<Option<Duration>, std::io::Error> {
+    REQUEST_DEADLINE.with(|slot| match slot.get() {
+        None => Ok(None),
+        Some(deadline) => deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .map(Some)
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "request deadline exceeded")
+            }),
+    })
+}
 
 use atrium_xrpc::http::{Request, Response};
 use atrium_xrpc::HttpClient;
@@ -95,7 +286,9 @@ impl VitaHttpClient {
         let total = content_length(&resp);
         if let Some(t) = total {
             if t > max_bytes {
-                return Err(format!("body too large: Content-Length {t} > cap {max_bytes}"));
+                return Err(format!(
+                    "body too large: Content-Length {t} > cap {max_bytes}"
+                ));
             }
         }
         // Stream straight to disk via a `.part` sidecar, capped, then install.
@@ -116,7 +309,28 @@ impl HttpClient for VitaHttpClient {
             let url = parts.uri.to_string();
             let method = parts.method.as_str();
 
+            let remaining = remaining_request_time()?;
+            #[cfg(test)]
+            if let Some(timeout) = remaining {
+                TEST_SEND_TIMEOUTS.with(|timeouts| timeouts.borrow_mut().push(timeout));
+            }
+            let scoped_agent;
+            let agent = if let Some(remaining) = remaining {
+                scoped_agent = ureq::AgentBuilder::new()
+                    .resolver(resolve_host)
+                    .timeout_connect(remaining.min(MAX_CONNECT_SLICE))
+                    .timeout_read(remaining)
+                    .timeout_write(remaining)
+                    .redirects(0)
+                    .build();
+                &scoped_agent
+            } else {
+                &agent
+            };
             let mut req = agent.request(method, &url);
+            if let Some(remaining) = remaining {
+                req = req.timeout(remaining);
+            }
             for (name, value) in parts.headers.iter() {
                 req = req.set(name.as_str(), value.to_str()?);
             }
@@ -148,6 +362,7 @@ impl HttpClient for VitaHttpClient {
             let total = content_length(&resp);
             let body_bytes = read_capped(resp.into_reader(), MAX_XRPC_BYTES, total, |_, _| {})
                 .map_err(Box::<dyn Error + Send + Sync + 'static>::from)?;
+            remaining_request_time()?;
             Ok(builder.body(body_bytes)?)
         }
     }
@@ -172,7 +387,9 @@ fn read_capped(
 ) -> Result<Vec<u8>, String> {
     if let Some(t) = total {
         if t > max_bytes {
-            return Err(format!("body too large: Content-Length {t} > cap {max_bytes}"));
+            return Err(format!(
+                "body too large: Content-Length {t} > cap {max_bytes}"
+            ));
         }
     }
     let mut out: Vec<u8> = Vec::new();
@@ -184,10 +401,22 @@ fn read_capped(
         match reader.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
+                if REQUEST_DEADLINE.with(|slot| slot.get()).is_some()
+                    && remaining_request_time()
+                        .map_err(|error| error.to_string())?
+                        .is_none()
+                {
+                    unreachable!("scoped deadline returns Some while active");
+                }
                 if out.len() as u64 + n as u64 > max_bytes {
                     return Err(format!("body exceeded cap of {max_bytes} bytes"));
                 }
                 out.extend_from_slice(&buf[..n]);
+                #[cfg(test)]
+                if REQUEST_DEADLINE.with(|slot| slot.get()).is_some() {
+                    TEST_BODY_BYTES
+                        .with(|bytes| bytes.fetch_add(n, std::sync::atomic::Ordering::Relaxed));
+                }
                 on_progress(out.len() as u64, total);
             }
             Err(e) => return Err(format!("read: {e}")),
@@ -217,8 +446,8 @@ fn stream_to_file_capped(
     let part = std::path::PathBuf::from(part);
 
     let mut stream = || -> Result<(), String> {
-        let mut file = std::fs::File::create(&part)
-            .map_err(|e| format!("create {}: {e}", part.display()))?;
+        let mut file =
+            std::fs::File::create(&part).map_err(|e| format!("create {}: {e}", part.display()))?;
         let mut buf = [0u8; 64 * 1024];
         let mut written: u64 = 0;
         loop {
@@ -235,7 +464,8 @@ fn stream_to_file_capped(
                 .map_err(|e| format!("write {}: {e}", part.display()))?;
             on_progress(written, total);
         }
-        file.flush().map_err(|e| format!("flush {}: {e}", part.display()))
+        file.flush()
+            .map_err(|e| format!("flush {}: {e}", part.display()))
     };
 
     match stream() {
@@ -264,6 +494,354 @@ fn stream_to_file_capped(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::future::Future;
+    use std::sync::Arc;
+
+    struct NoopWake;
+    impl std::task::Wake for NoopWake {
+        fn wake(self: Arc<Self>) {}
+    }
+
+    #[test]
+    fn request_deadline_caps_slow_trickle_response() {
+        let _guard = TEST_NETWORK_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        use std::net::TcpListener;
+        use std::thread;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 1024];
+            let _ = stream.read(&mut request);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            for _ in 0..20 {
+                thread::sleep(Duration::from_millis(25));
+                if stream.write_all(b"x").is_err() {
+                    break;
+                }
+            }
+        });
+        let client = VitaHttpClient::new();
+        let request = Request::builder()
+            .method("GET")
+            .uri(format!("http://{address}/"))
+            .body(Vec::new())
+            .unwrap();
+        TEST_BODY_BYTES.with(|bytes| bytes.store(0, std::sync::atomic::Ordering::Relaxed));
+        let started = Instant::now();
+        let result = with_request_deadline(Duration::from_millis(100), || {
+            let mut future = Box::pin(client.send_http(request));
+            let waker = std::task::Waker::from(Arc::new(NoopWake));
+            let mut context = std::task::Context::from_waker(&waker);
+            match future.as_mut().poll(&mut context) {
+                std::task::Poll::Ready(result) => result,
+                std::task::Poll::Pending => panic!("blocking HTTP future unexpectedly pending"),
+            }
+        });
+        assert!(
+            result.is_err(),
+            "slow trickle must exceed absolute deadline"
+        );
+        assert!(started.elapsed() < Duration::from_millis(500));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn repeated_sends_receive_decreasing_remaining_timeouts() {
+        let _guard = TEST_NETWORK_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        use std::net::TcpListener;
+        TEST_SEND_TIMEOUTS.with(|timeouts| timeouts.borrow_mut().clear());
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0; 1024];
+                let _ = stream.read(&mut request);
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .unwrap();
+            }
+        });
+        let client = VitaHttpClient::new();
+        with_request_deadline(Duration::from_secs(1), || {
+            for _ in 0..2 {
+                let request = Request::builder()
+                    .method("GET")
+                    .uri(format!("http://{address}/"))
+                    .body(Vec::new())
+                    .unwrap();
+                let mut future = Box::pin(client.send_http(request));
+                let waker = std::task::Waker::from(Arc::new(NoopWake));
+                let mut context = std::task::Context::from_waker(&waker);
+                assert!(matches!(
+                    future.as_mut().poll(&mut context),
+                    std::task::Poll::Ready(Ok(_))
+                ));
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+        server.join().unwrap();
+        TEST_SEND_TIMEOUTS.with(|timeouts| {
+            let values = timeouts.borrow();
+            assert_eq!(values.len(), 2);
+            assert!(values[1] < values[0]);
+        });
+    }
+
+    #[test]
+    fn scoped_redirect_is_returned_as_original_response_without_following() {
+        let _guard = TEST_NETWORK_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 1024];
+            let _ = stream.read(&mut request);
+            stream.write_all(b"HTTP/1.1 302 Found\r\nLocation: /other\r\nContent-Length: 8\r\nConnection: close\r\n\r\nredirect").unwrap();
+            let mut extra = [0; 1];
+            assert_eq!(
+                stream.read(&mut extra).unwrap_or(0),
+                0,
+                "redirect must not be followed"
+            );
+        });
+        let request = Request::builder()
+            .method("GET")
+            .uri(format!("http://{address}/start"))
+            .body(Vec::new())
+            .unwrap();
+        let client = VitaHttpClient::new();
+        let response = with_request_deadline(Duration::from_secs(3), || {
+            let mut future = Box::pin(client.send_http(request));
+            let waker = std::task::Waker::from(Arc::new(NoopWake));
+            let mut context = std::task::Context::from_waker(&waker);
+            match future.as_mut().poll(&mut context) {
+                std::task::Poll::Ready(result) => result.unwrap(),
+                std::task::Poll::Pending => panic!("blocking HTTP future unexpectedly pending"),
+            }
+        });
+        assert_eq!(response.status(), 302);
+        assert_eq!(response.headers().get("location").unwrap(), "/other");
+        assert_eq!(response.body(), b"redirect");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn expired_request_is_rejected_before_send() {
+        with_request_deadline(Duration::from_millis(1), || {
+            std::thread::sleep(Duration::from_millis(5));
+            assert_eq!(
+                remaining_request_time().unwrap_err().kind(),
+                std::io::ErrorKind::TimedOut
+            );
+        });
+    }
+
+    #[test]
+    fn request_deadline_scope_restores_and_narrows_nested_deadline() {
+        assert!(remaining_request_time().unwrap().is_none());
+        with_request_deadline(Duration::from_secs(5), || {
+            let before = remaining_request_time().unwrap().unwrap();
+            assert!(before <= Duration::from_secs(5));
+            with_request_deadline(Duration::from_millis(20), || {
+                assert!(remaining_request_time().unwrap().unwrap() <= Duration::from_millis(20));
+            });
+            assert!(remaining_request_time().unwrap().unwrap() <= before);
+        });
+        assert!(remaining_request_time().unwrap().is_none());
+    }
+
+    struct TestDnsReset;
+
+    impl Drop for TestDnsReset {
+        fn drop(&mut self) {
+            clear_test_dns();
+        }
+    }
+
+    fn install_test_dns(
+        lookup: Arc<dyn Fn(&str) -> std::io::Result<Vec<SocketAddr>> + Send + Sync>,
+    ) -> TestDnsReset {
+        *TEST_DNS_LOOKUP
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap() = Some(lookup);
+        TestDnsReset
+    }
+
+    fn clear_test_dns() {
+        *TEST_DNS_LOOKUP
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+
+    #[test]
+    fn blocked_dns_deadline_returns_timeout_without_spawning_replacement() {
+        let _guard = TEST_NETWORK_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let (result_tx, result_rx) = mpsc::channel();
+        TEST_RESOLVER_CALLS.store(0, std::sync::atomic::Ordering::SeqCst);
+        let _dns_reset = install_test_dns(Arc::new(move |hostport| {
+            if hostport.starts_with("blocked.test:") {
+                let _ = started_tx.send(());
+                let _ = release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(2));
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "test DNS lookup released",
+                ));
+            }
+            Ok(vec!["127.0.0.1:80".parse().unwrap()])
+        }));
+        let caller = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_millis(100);
+            let result =
+                with_absolute_request_deadline(deadline, || resolve_host("blocked.test:80"));
+            result_tx
+                .send(result.map_err(|error| error.kind()))
+                .unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(
+            result_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Err(std::io::ErrorKind::TimedOut)
+        );
+        let pool = dns_pool();
+        let mut accepted = 0;
+        for index in 0..DNS_QUEUE {
+            let (reply, _result) = mpsc::sync_channel(1);
+            match pool
+                .sender
+                .try_send((format!("queued-{index}.test:80"), reply))
+            {
+                Ok(()) => accepted += 1,
+                Err(mpsc::TrySendError::Full(_)) => break,
+                Err(mpsc::TrySendError::Disconnected(_)) => panic!("DNS pool disconnected"),
+            }
+        }
+        let second = std::thread::spawn(|| {
+            let deadline = Instant::now() + Duration::from_millis(100);
+            with_absolute_request_deadline(deadline, || resolve_host("blocked.test:81"))
+                .unwrap_err()
+                .kind()
+        });
+        let second_error = second.join().unwrap();
+        assert!(matches!(
+            second_error,
+            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+        ));
+        assert!(
+            TEST_RESOLVER_CALLS.load(std::sync::atomic::Ordering::SeqCst)
+                <= DNS_QUEUE + DNS_THREADS
+        );
+        assert!(accepted <= DNS_QUEUE);
+        let second = std::thread::spawn(|| {
+            with_absolute_request_deadline(Instant::now() + Duration::from_millis(50), || {
+                resolve_host("blocked.test:81")
+            })
+            .unwrap_err()
+            .kind()
+        });
+        assert!(matches!(
+            second.join().unwrap(),
+            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+        ));
+        assert!(
+            TEST_RESOLVER_CALLS.load(std::sync::atomic::Ordering::SeqCst)
+                <= DNS_QUEUE + DNS_THREADS
+        );
+        let _ = release_tx.send(());
+        caller.join().unwrap();
+    }
+
+    #[test]
+    fn expired_dns_deadline_rejects_cached_and_uncached_hosts_before_admission() {
+        let _guard = TEST_NETWORK_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let lookup_calls = calls.clone();
+        let _dns_reset = install_test_dns(Arc::new(move |hostport| {
+            if hostport.starts_with("expired-") {
+                lookup_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            Ok(vec!["127.0.0.1:80".parse().unwrap()])
+        }));
+        let address: SocketAddr = "127.0.0.1:80".parse().unwrap();
+        let pool = dns_pool();
+        let cached_host = "expired-cached.test:80";
+        let uncached_host = "expired-uncached.test:80";
+        pool.cache
+            .lock()
+            .unwrap()
+            .push((cached_host.into(), vec![address]));
+        let expired = Instant::now() + Duration::from_millis(1);
+        for hostport in [cached_host, uncached_host] {
+            let error = with_absolute_request_deadline(expired, || {
+                std::thread::sleep(Duration::from_millis(5));
+                resolve_host(hostport)
+            })
+            .unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        pool.cache
+            .lock()
+            .unwrap()
+            .retain(|(key, _)| key != cached_host);
+    }
+
+    #[test]
+    fn http_401_response_body_is_preserved() {
+        let _guard = TEST_NETWORK_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 1024];
+            let _ = stream.read(&mut request);
+            stream.write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 18\r\nConnection: close\r\n\r\ninvalid token body").unwrap();
+        });
+        let request = Request::builder()
+            .method("GET")
+            .uri(format!("http://{address}/"))
+            .body(Vec::new())
+            .unwrap();
+        let client = VitaHttpClient::new();
+        let response = with_request_deadline(Duration::from_secs(3), || {
+            let mut future = Box::pin(client.send_http(request));
+            let waker = std::task::Waker::from(Arc::new(NoopWake));
+            let mut context = std::task::Context::from_waker(&waker);
+            match future.as_mut().poll(&mut context) {
+                std::task::Poll::Ready(result) => result.unwrap(),
+                std::task::Poll::Pending => panic!("blocking HTTP future unexpectedly pending"),
+            }
+        });
+        assert_eq!(response.status(), 401);
+        assert_eq!(response.body(), b"invalid token body");
+        server.join().unwrap();
+    }
 
     #[test]
     fn read_capped_rejects_oversized_content_length() {
@@ -326,7 +904,10 @@ mod tests {
         assert!(!dest.exists(), "no final file on cap failure");
         let mut part = dest.into_os_string();
         part.push(".part");
-        assert!(!std::path::Path::new(&part).exists(), "no .part left behind");
+        assert!(
+            !std::path::Path::new(&part).exists(),
+            "no .part left behind"
+        );
     }
 
     #[test]

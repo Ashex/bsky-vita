@@ -99,8 +99,7 @@ impl TabBar {
                 TopLevel::Profile => &mut self.profile,
             };
             let pressed_now = ctx.touches.iter().any(|t| rect.contains(t.x, t.y));
-            let just_clicked =
-                state.pressed_last && !pressed_now && ctx.touches.is_empty();
+            let just_clicked = state.pressed_last && !pressed_now && ctx.touches.is_empty();
             state.pressed_last = pressed_now;
             if just_clicked && *tab != self.active {
                 clicked = Some(*tab);
@@ -122,13 +121,7 @@ impl TabBar {
 
             // Active indicator: 3 px accent bar across the top of the cell.
             if is_active {
-                frame.fill_rect(
-                    x as f32,
-                    y as f32,
-                    cell_w as f32,
-                    3.0,
-                    theme::ACCENT,
-                );
+                frame.fill_rect(x as f32, y as f32, cell_w as f32, 3.0, theme::ACCENT);
             }
         }
 

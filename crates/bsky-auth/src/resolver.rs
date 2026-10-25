@@ -10,9 +10,7 @@
 pub use atrium_identity::identity_resolver::ResolvedIdentity;
 
 use atrium_common::resolver::Resolver;
-use atrium_identity::did::{
-    CommonDidResolver, CommonDidResolverConfig, DEFAULT_PLC_DIRECTORY_URL,
-};
+use atrium_identity::did::{CommonDidResolver, CommonDidResolverConfig, DEFAULT_PLC_DIRECTORY_URL};
 use atrium_identity::handle::{AppViewHandleResolver, AppViewHandleResolverConfig};
 use atrium_identity::identity_resolver::{IdentityResolver, IdentityResolverConfig};
 use bsky_net::VitaHttpClient;

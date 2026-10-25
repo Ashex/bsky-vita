@@ -78,19 +78,8 @@ unsafe extern "C" {
     // Primitive drawing
     pub fn vita2d_draw_pixel(x: c_float, y: c_float, color: c_uint);
     pub fn vita2d_draw_line(x0: c_float, y0: c_float, x1: c_float, y1: c_float, color: c_uint);
-    pub fn vita2d_draw_rectangle(
-        x: c_float,
-        y: c_float,
-        w: c_float,
-        h: c_float,
-        color: c_uint,
-    );
-    pub fn vita2d_draw_fill_circle(
-        x: c_float,
-        y: c_float,
-        radius: c_float,
-        color: c_uint,
-    );
+    pub fn vita2d_draw_rectangle(x: c_float, y: c_float, w: c_float, h: c_float, color: c_uint);
+    pub fn vita2d_draw_fill_circle(x: c_float, y: c_float, radius: c_float, color: c_uint);
 
     // PGF system font (Sony's bitmap font; covers Latin + Japanese + Chinese
     // + Korean depending on which language packs are loaded).
@@ -178,11 +167,7 @@ unsafe extern "C" {
     // Draw variants. The `_part_scale` form picks a sub-rectangle from
     // the source texture (atlas) and scales it independently per axis —
     // exactly what we need for emoji glyph rendering.
-    pub fn vita2d_draw_texture(
-        texture: *const vita2d_texture,
-        x: c_float,
-        y: c_float,
-    );
+    pub fn vita2d_draw_texture(texture: *const vita2d_texture, x: c_float, y: c_float);
     pub fn vita2d_draw_texture_scale(
         texture: *const vita2d_texture,
         x: c_float,

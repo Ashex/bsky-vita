@@ -1,0 +1,234 @@
+import { createSignal } from "solid-js";
+import {
+  ActionHandler,
+  Text,
+  View,
+} from "@pocketjs/framework/solid/components";
+import { BTN } from "@pocketjs/framework/input";
+import {
+  FeedDelivery,
+  parseDelivery,
+  requestFeed,
+  takeFeedCommands,
+} from "./feed";
+import {
+  firstCandidates,
+  layoutRows,
+  parseMeasureRequest,
+  validateReply,
+  type MeasureReply,
+  type MeasureRequest,
+} from "./visible_text";
+import { For } from "solid-js";
+export function Timeline() {
+  const [delivery, setDelivery] = createSignal<FeedDelivery | null>(null);
+  const [error, setError] = createSignal("");
+  const [layout, setLayout] = createSignal<ReturnType<typeof layoutRows>>([]);
+  let active: MeasureRequest | null = null;
+  globalThis.__bskyTakeFeedCommands = () => JSON.stringify(takeFeedCommands());
+  globalThis.__bskySetFeedError = (m) => setError(m.slice(0, 160));
+  requestFeed("first_page");
+  globalThis.__bskyReceiveFeed = (raw) => {
+    const next = parseDelivery(raw);
+    if (!next) {
+      setError("Feed data unavailable");
+      return;
+    }
+    setError("");
+    setDelivery(next);
+    setLayout([]);
+    globalThis.nativeBatch.commands = [];
+  };
+  globalThis.__bskyVisibleCandidates = (raw) => {
+    const req = parseMeasureRequest(raw);
+    if (!req) return "";
+    const history = delivery()?.posts ?? [];
+    const candidate = req.rows.map((row) =>
+      history.find((post) => post.uri === row.uri),
+    );
+    if (candidate.some((p) => !p)) return "";
+    active = req;
+    globalThis.__bskyVisiblePlacement = "";
+    return JSON.stringify({
+      schema: 1,
+      stamp: req.stamp,
+      rows: candidate.map((p, i) => ({
+        uri: p!.uri,
+        width: req.rows[i]!.width,
+        text: p!.state.state === "clean" ? p!.text : "",
+        status: p!.state.state === "clean" ? "ready" : "placeholder",
+      })),
+    });
+  };
+  globalThis.__bskyVisibleMeasured = (raw) => {
+    if (!active) return "";
+    try {
+      const reply = JSON.parse(raw) as MeasureReply;
+      if (!validateReply(reply, active)) {
+        active = null;
+        return "";
+      }
+      const history = delivery()?.posts ?? [];
+      const rows = layoutRows(
+        reply.rows.map((row) => {
+          const post = history.find((entry) => entry.uri === row.uri);
+          return {
+            ...row,
+            context:
+              post?.state.state === "clean" ? (post.context ?? null) : null,
+          };
+        }),
+      );
+      const next = JSON.stringify({
+        schema: 1,
+        stamp: reply.stamp,
+        rows: rows.map((r) => ({
+          uri: r.uri,
+          x: r.body_x,
+          y: r.body_y,
+          body_height: r.body_height,
+        })),
+      });
+      globalThis.__bskyVisiblePlacement = next;
+      setLayout(rows);
+    } catch {
+      globalThis.__bskyVisiblePlacement = "";
+    }
+    active = null;
+    return "";
+  };
+  const posts = () => firstCandidates(delivery()?.posts ?? []);
+  const status = () =>
+    error() ||
+    (!delivery()
+      ? "Loading following feed…"
+      : posts().length
+        ? ""
+        : "No posts yet");
+  return (
+    <View class="relative w-full h-full overflow-hidden bg-slate-950">
+      <Text
+        class="absolute text-lg text-white font-bold"
+        style={{ insetL: 12, insetT: 8, height: 22 }}
+      >
+        Following
+      </Text>
+      {status() && (
+        <Text
+          class="absolute text-xs text-slate-400"
+          style={{ insetL: 12, insetT: 30, height: 12 }}
+        >
+          {status()}
+        </Text>
+      )}
+      <For each={posts()}>
+        {(post, index) => {
+          const rect = () => layout().find((row) => row.uri === post.uri);
+          const top = () => rect()?.y ?? 40 + index() * 92;
+          const contextHeight = () => rect()?.context_height ?? 0;
+          const bodyY = () => rect()?.body_y ?? top() + 42;
+          const cardHeight = () => rect()?.height ?? 84;
+          const bodyHeight = () => rect()?.body_height ?? 18;
+          const x = () => rect()?.x ?? 12;
+          const width = () => rect()?.width ?? 456;
+          return (
+            <>
+              <View
+                class="absolute rounded-lg bg-slate-900"
+                style={{
+                  insetL: x(),
+                  insetT: top(),
+                  width: width(),
+                  height: cardHeight(),
+                }}
+              />
+              <Text
+                class="absolute text-sm text-white font-bold"
+                style={{
+                  insetL: x() + 8,
+                  insetT: top() + 8,
+                  width: width() - 16,
+                  height: 22,
+                }}
+              >
+                {post.state.state === "clean"
+                  ? (post.author.display_name || post.author.handle) +
+                    " · @" +
+                    post.author.handle
+                  : "Content unavailable"}
+              </Text>
+              {post.state.state === "clean" && post.context && (
+                <Text
+                  class="absolute text-xs text-sky-300"
+                  style={{
+                    insetL: x() + 8,
+                    insetT: bodyY() - contextHeight(),
+                    width: width() - 16,
+                    height: 12,
+                  }}
+                >
+                  {
+                    {
+                      reply: "Reply",
+                      repost: "Reposted",
+                      quote: "Quote",
+                      external: "External link",
+                      video: "Video",
+                      unsupported: "Unsupported attachment",
+                    }[post.context]
+                  }
+                </Text>
+              )}
+              {post.state.state === "clean" && (
+                <Text
+                  class="absolute text-xs text-slate-200"
+                  style={{
+                    insetL: x() + 8,
+                    insetT: bodyY(),
+                    width: width() - 16,
+                    height: bodyHeight(),
+                  }}
+                />
+              )}
+              <Text
+                class="absolute text-xs text-slate-400"
+                style={{
+                  insetL: x() + 8,
+                  insetT: bodyY() + bodyHeight() + 4,
+                  width: width() - 16,
+                  height: 12,
+                }}
+              >
+                {post.state.state === "clean"
+                  ? `♥ ${post.like_count}  ↻ ${post.repost_count}  ◌ ${post.reply_count}`
+                  : ""}
+              </Text>
+            </>
+          );
+        }}
+      </For>
+      <ActionHandler
+        button={BTN.CROSS}
+        onPress={() =>
+          requestFeed(
+            error() ? "retry" : delivery()?.cursor ? "next_page" : "refresh",
+          )
+        }
+      />
+      <ActionHandler
+        button={BTN.TRIANGLE}
+        onPress={() => requestFeed("refresh")}
+      />
+      {delivery()?.cursor && (
+        <Text class="text-xs text-sky-300">More posts available · Cross</Text>
+      )}
+      <Text class="text-xs text-sky-300">Refresh · Triangle</Text>
+      {error() && <Text class="text-xs text-sky-300">Retry · Cross</Text>}
+    </View>
+  );
+}
+declare global {
+  var __bskyVisibleCandidates: (json: string) => string;
+  var __bskyVisibleMeasured: (json: string) => string;
+  var __bskyVisiblePlacement: string;
+}

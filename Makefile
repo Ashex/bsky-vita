@@ -1,12 +1,15 @@
 APP_DIR := app
 TITLE_ID := BSKY00001
 VPK := target/armv7-sony-vita-newlibeabihf/release/bsky-vita.vpk
+POCKET_VPK := target/armv7-sony-vita-newlibeabihf/release/bsky-vita-pocketjs-poc.vpk
 
-.PHONY: build build-fast run run-fast install push-creds push-font push-emoji push-mask push-gxp fetch-log fetch-gxp test clean help
+.PHONY: build build-fast build-pocket prepare-pocket test clean help run run-fast install push-creds push-font push-emoji push-mask push-gxp fetch-log fetch-gxp
 
 help:
 	@echo "Targets:"
 	@echo "  build        Release VPK via cargo-vita (opt-level=z + LTO; ~90 s rebuild)"
+	@echo "  build-pocket Opt-in PocketJS VPK (prepares pinned source and package first)"
+	@echo "  prepare-pocket Bootstrap pinned PocketJS and deterministically package guest asset"
 	@echo "  build-fast   Dev VPK (opt-level=1, no LTO; ~20 s rebuild). Runtime is slower"
 	@echo "               but builds iterate ~5x faster — use for layout/network bring-up,"
 	@echo "               switch back to release for perf-sensitive testing."
@@ -31,6 +34,16 @@ help:
 
 build:
 	cd $(APP_DIR) && cargo vita build vpk -- --release
+	cp $(VPK) $(VPK).tmp
+	mv $(VPK).tmp $(VPK).default
+
+prepare-pocket:
+	./pocket-ui/scripts/prepare.sh
+
+build-pocket: prepare-pocket
+	cd $(APP_DIR) && cargo vita build vpk -- --release --features pocketjs-poc
+	cp $(VPK) $(POCKET_VPK).tmp
+	mv $(POCKET_VPK).tmp $(POCKET_VPK)
 
 # Dev-profile build: opt-level=1 (per workspace [profile.dev]), no LTO,
 # multiple codegen units. ~5x faster rebuild than release. Runtime is

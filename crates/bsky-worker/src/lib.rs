@@ -40,30 +40,27 @@ use std::thread::{self, JoinHandle};
 
 use std::str::FromStr;
 
-use atrium_api::app::bsky::actor::defs::{
-    PreferencesItem, ProfileView, ProfileViewDetailedData,
-};
+use atrium_api::agent::bluesky::{AtprotoServiceType, BSKY_CHAT_DID};
+use atrium_api::app::bsky::actor::defs::{PreferencesItem, ProfileView, ProfileViewDetailedData};
 use atrium_api::app::bsky::actor::{get_preferences, get_profile, search_actors};
-use atrium_api::app::bsky::feed::search_posts;
 use atrium_api::app::bsky::feed::defs::{
     FeedViewPost, GeneratorView, PostView, ThreadViewPostParentRefs, ThreadViewPostRepliesItem,
 };
+use atrium_api::app::bsky::feed::get_post_thread::OutputThreadRefs;
+use atrium_api::app::bsky::feed::like::RecordData as LikeRecordData;
+use atrium_api::app::bsky::feed::post::{RecordData as PostRecordData, ReplyRef, ReplyRefData};
+use atrium_api::app::bsky::feed::repost::RecordData as RepostRecordData;
+use atrium_api::app::bsky::feed::search_posts;
 use atrium_api::app::bsky::feed::{
     get_actor_feeds, get_actor_likes, get_author_feed, get_feed, get_feed_generators,
     get_post_thread, get_timeline,
 };
-use atrium_api::app::bsky::feed::get_post_thread::OutputThreadRefs;
 use atrium_api::app::bsky::graph::defs::{ListView, StarterPackViewBasic};
-use atrium_api::app::bsky::graph::{get_actor_starter_packs, get_lists};
-use atrium_api::app::bsky::feed::like::RecordData as LikeRecordData;
-use atrium_api::app::bsky::feed::post::{RecordData as PostRecordData, ReplyRef, ReplyRefData};
-use atrium_api::app::bsky::feed::repost::RecordData as RepostRecordData;
 use atrium_api::app::bsky::graph::follow::RecordData as FollowRecordData;
+use atrium_api::app::bsky::graph::{get_actor_starter_packs, get_lists};
 use atrium_api::app::bsky::notification::list_notifications;
 use atrium_api::app::bsky::notification::list_notifications::Notification;
 use atrium_api::app::bsky::notification::update_seen;
-use atrium_api::com::atproto::repo::{create_record, delete_record};
-use atrium_api::agent::bluesky::{AtprotoServiceType, BSKY_CHAT_DID};
 use atrium_api::chat::bsky::convo::defs::{
     ConvoView, DeletedMessageView, MessageInputData, MessageView,
 };
@@ -71,12 +68,17 @@ use atrium_api::chat::bsky::convo::get_messages::OutputMessagesItem;
 use atrium_api::chat::bsky::convo::{
     get_convo_for_members, get_messages, list_convos, send_message, update_read,
 };
+use atrium_api::com::atproto::repo::{create_record, delete_record};
 use atrium_api::types::string::{AtIdentifier, Datetime, Did, Nsid, RecordKey};
 use atrium_api::types::{LimitedNonZeroU8, LimitedU16, Union, Unknown};
 use bsky_auth::{agent_call, AuthClient};
-use bsky_net::VitaHttpClient;
+use bsky_feed::{FeedCorrelation, FeedDelivery};
+use bsky_net::{with_absolute_request_deadline, VitaHttpClient};
 use crossbeam_channel::{bounded, unbounded, Receiver, Sender, TryRecvError};
 use futures::executor::block_on;
+use std::time::{Duration, Instant};
+mod feed_projection;
+use feed_projection::project_page;
 
 /// Identifies which feed a `FetchFeed` request targets.
 ///
@@ -124,6 +126,13 @@ pub enum WorkRequest {
     /// `FeedPage` response. End-of-feed is signalled by a response with
     /// `cursor: None`.
     FetchFeed {
+        source: FeedSource,
+        cursor: Option<String>,
+    },
+    /// Additive PocketJS feed operation. Identity is captured by the caller before enqueue.
+    FetchFeedCorrelated {
+        correlation: FeedCorrelation,
+        deadline: Option<Instant>,
         source: FeedSource,
         cursor: Option<String>,
     },
@@ -183,15 +192,9 @@ pub enum WorkRequest {
     /// (server tracks read state independently).
     MarkSeen { seen_at: Datetime },
     /// Search for actors matching `q`. Cursor-paginated.
-    SearchActors {
-        q: String,
-        cursor: Option<String>,
-    },
+    SearchActors { q: String, cursor: Option<String> },
     /// Search for posts matching `q`. Cursor-paginated.
-    SearchPosts {
-        q: String,
-        cursor: Option<String>,
-    },
+    SearchPosts { q: String, cursor: Option<String> },
     /// Download a video blob via `com.atproto.sync.getBlob` and write
     /// it to a local file. atrium routes the call to the right PDS;
     /// the handler skips the network round-trip if the file is
@@ -200,14 +203,23 @@ pub enum WorkRequest {
     /// Fetch a page of feed generators (custom feeds) created by
     /// `actor` via `app.bsky.feed.getActorFeeds`. Used by
     /// ProfileScreen's Feeds tab. `actor` is the resolved DID.
-    FetchActorFeeds { actor: String, cursor: Option<String> },
+    FetchActorFeeds {
+        actor: String,
+        cursor: Option<String>,
+    },
     /// Fetch a page of lists curated by `actor` via
     /// `app.bsky.graph.getLists`. Used by ProfileScreen's Lists tab.
-    FetchActorLists { actor: String, cursor: Option<String> },
+    FetchActorLists {
+        actor: String,
+        cursor: Option<String>,
+    },
     /// Fetch a page of starter packs created by `actor` via
     /// `app.bsky.graph.getActorStarterPacks`. Used by
     /// ProfileScreen's Packs tab.
-    FetchActorStarterPacks { actor: String, cursor: Option<String> },
+    FetchActorStarterPacks {
+        actor: String,
+        cursor: Option<String>,
+    },
     /// List the user's DM conversations via `chat.bsky.convo.listConvos`
     /// (most-recent-activity first). Cursor-paginated.
     FetchConvos { cursor: Option<String> },
@@ -379,6 +391,10 @@ pub enum WorkResponse {
         source: FeedSource,
         batch: Result<TimelineBatch, String>,
     },
+    FeedPageCorrelated {
+        correlation: FeedCorrelation,
+        batch: Result<FeedDelivery, String>,
+    },
     /// User's pinned saved feeds (already hydrated with display metadata).
     SavedFeeds(Result<SavedFeedsBatch, String>),
     /// Raw bytes of the requested image. Caller decodes with
@@ -488,6 +504,7 @@ impl WorkResponse {
         let err: Option<&str> = match self {
             WorkResponse::Profile(Err(e)) => Some(e),
             WorkResponse::FeedPage { batch: Err(e), .. } => Some(e),
+            WorkResponse::FeedPageCorrelated { batch: Err(e), .. } => Some(e),
             WorkResponse::SavedFeeds(Err(e)) => Some(e),
             WorkResponse::PostCreated(Err(e)) => Some(e),
             WorkResponse::PostDeleted { result: Err(e), .. } => Some(e),
@@ -520,6 +537,80 @@ impl WorkResponse {
 /// the render thread must never block on `send`, and duplicate media requests
 /// are coalesced (see [`Worker::send`]).
 const RESPONSE_CAP: usize = 128;
+const REQUEST_DEADLINE: Duration = Duration::from_secs(45);
+
+fn admit_feed_request(
+    correlation: FeedCorrelation,
+    source: FeedSource,
+    cursor: Option<String>,
+) -> WorkRequest {
+    WorkRequest::FetchFeedCorrelated {
+        correlation,
+        source,
+        cursor,
+        deadline: Some(Instant::now() + REQUEST_DEADLINE),
+    }
+}
+
+fn expired_feed_response(req: &WorkRequest, now: Instant) -> Option<WorkResponse> {
+    match req {
+        WorkRequest::FetchFeedCorrelated {
+            correlation,
+            deadline: Some(deadline),
+            ..
+        } if now >= *deadline => Some(WorkResponse::FeedPageCorrelated {
+            correlation: correlation.clone(),
+            batch: Err("feed request deadline exceeded".into()),
+        }),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+
+    fn correlation() -> FeedCorrelation {
+        FeedCorrelation {
+            schema: 1,
+            auth_generation: 1,
+            mount_generation: 1,
+            request_id: 1,
+            source: "Following".into(),
+            cursor: None,
+        }
+    }
+
+    #[test]
+    fn correlated_request_deadline_includes_queue_wait() {
+        let request = admit_feed_request(correlation(), FeedSource::Following, None);
+        let original_deadline = match &request {
+            WorkRequest::FetchFeedCorrelated { deadline, .. } => deadline.unwrap(),
+            _ => unreachable!(),
+        };
+        let later = original_deadline + Duration::from_millis(1);
+        assert!(expired_feed_response(&request, later).is_some());
+        assert!(expired_feed_response(
+            &WorkRequest::FetchFeed {
+                source: FeedSource::Following,
+                cursor: None
+            },
+            later
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn expired_correlated_request_is_rejected_before_feed_operation() {
+        let request = WorkRequest::FetchFeedCorrelated {
+            correlation: correlation(),
+            source: FeedSource::Following,
+            cursor: None,
+            deadline: Some(Instant::now() - Duration::from_millis(1)),
+        };
+        assert!(expired_feed_response(&request, Instant::now()).is_some());
+    }
+}
 
 /// Handle to the worker thread. Holds the channel ends and the thread's
 /// `JoinHandle`. `send` is non-blocking (unbounded request channel); the
@@ -568,6 +659,15 @@ impl Worker {
         // the shared texture cache that satisfies every waiting caller. Keyed
         // on the same string the `Image` response echoes back, so `try_recv`
         // can clear it.
+        let req = match req {
+            WorkRequest::FetchFeedCorrelated {
+                correlation,
+                source,
+                cursor,
+                deadline: None,
+            } => admit_feed_request(correlation, source, cursor),
+            other => other,
+        };
         if let Some(key) = image_request_key(&req) {
             if !self.inflight.borrow_mut().insert(key) {
                 return;
@@ -609,13 +709,21 @@ fn image_request_key(req: &WorkRequest) -> Option<String> {
     }
 }
 
-fn run(
-    client: Arc<AuthClient>,
-    requests: Receiver<WorkRequest>,
-    responses: Sender<WorkResponse>,
-) {
+fn run(client: Arc<AuthClient>, requests: Receiver<WorkRequest>, responses: Sender<WorkResponse>) {
     while let Ok(req) = requests.recv() {
-        let resp = handle_request(&client, req, &responses);
+        let resp = match &req {
+            WorkRequest::FetchFeedCorrelated { deadline, .. } => {
+                if let Some(response) = expired_feed_response(&req, Instant::now()) {
+                    response
+                } else {
+                    let deadline = deadline.unwrap_or_else(|| Instant::now() + REQUEST_DEADLINE);
+                    with_absolute_request_deadline(deadline, || {
+                        handle_request(&client, req, &responses)
+                    })
+                }
+            }
+            _ => handle_request(&client, req, &responses),
+        };
         log_if_err(&resp);
         if responses.send(resp).is_err() {
             // Main thread dropped the receiver — exit.
@@ -632,7 +740,10 @@ fn run(
 fn log_if_err(resp: &WorkResponse) {
     match resp {
         WorkResponse::Profile(Err(e)) => bsky_log::log!("worker: Profile err: {e}"),
-        WorkResponse::FeedPage { source, batch: Err(e) } => {
+        WorkResponse::FeedPage {
+            source,
+            batch: Err(e),
+        } => {
             bsky_log::log!("worker: FeedPage({source:?}) err: {e}")
         }
         WorkResponse::SavedFeeds(Err(e)) => bsky_log::log!("worker: SavedFeeds err: {e}"),
@@ -640,7 +751,10 @@ fn log_if_err(resp: &WorkResponse) {
             bsky_log::log!("worker: Image({url}) err: {e}")
         }
         WorkResponse::PostCreated(Err(e)) => bsky_log::log!("worker: PostCreated err: {e}"),
-        WorkResponse::PostDeleted { uri, result: Err(e) } => {
+        WorkResponse::PostDeleted {
+            uri,
+            result: Err(e),
+        } => {
             bsky_log::log!("worker: PostDeleted({uri}) err: {e}")
         }
         WorkResponse::LikeChanged(Err(e)) => bsky_log::log!("worker: LikeChanged err: {e}"),
@@ -660,23 +774,41 @@ fn log_if_err(resp: &WorkResponse) {
         WorkResponse::SearchPosts(Err(e)) => {
             bsky_log::log!("worker: SearchPosts err: {e}")
         }
-        WorkResponse::VideoBlob { cid, result: Err(e) } => {
+        WorkResponse::VideoBlob {
+            cid,
+            result: Err(e),
+        } => {
             bsky_log::log!("worker: VideoBlob({cid}) err: {e}")
         }
-        WorkResponse::ActorFeeds { actor, batch: Err(e) } => {
+        WorkResponse::ActorFeeds {
+            actor,
+            batch: Err(e),
+        } => {
             bsky_log::log!("worker: ActorFeeds({actor}) err: {e}")
         }
-        WorkResponse::ActorLists { actor, batch: Err(e) } => {
+        WorkResponse::ActorLists {
+            actor,
+            batch: Err(e),
+        } => {
             bsky_log::log!("worker: ActorLists({actor}) err: {e}")
         }
-        WorkResponse::ActorStarterPacks { actor, batch: Err(e) } => {
+        WorkResponse::ActorStarterPacks {
+            actor,
+            batch: Err(e),
+        } => {
             bsky_log::log!("worker: ActorStarterPacks({actor}) err: {e}")
         }
         WorkResponse::Convos(Err(e)) => bsky_log::log!("worker: Convos err: {e}"),
-        WorkResponse::ConvoMessages { convo_id, batch: Err(e) } => {
+        WorkResponse::ConvoMessages {
+            convo_id,
+            batch: Err(e),
+        } => {
             bsky_log::log!("worker: ConvoMessages({convo_id}) err: {e}")
         }
-        WorkResponse::MessageSent { convo_id, result: Err(e) } => {
+        WorkResponse::MessageSent {
+            convo_id,
+            result: Err(e),
+        } => {
             bsky_log::log!("worker: MessageSent({convo_id}) err: {e}")
         }
         WorkResponse::ConvoForMembers(Err(e)) => {
@@ -714,15 +846,57 @@ fn handle_request(
                     )));
                 }
             };
-            let result = agent_call!(client, |a| a.api.app.bsky.actor.get_profile(
-                get_profile::ParametersData { actor: at_id }.into(),
-            ));
+            let result = agent_call!(client, |a| a
+                .api
+                .app
+                .bsky
+                .actor
+                .get_profile(get_profile::ParametersData { actor: at_id }.into(),));
             match result {
                 Ok(p) => WorkResponse::Profile(Ok(Box::new(p.data))),
                 Err(e) => WorkResponse::Profile(Err(format!("{e}"))),
             }
         }
         WorkRequest::FetchFeed { source, cursor } => fetch_feed_page(client, source, cursor),
+        WorkRequest::FetchFeedCorrelated {
+            correlation,
+            source,
+            cursor,
+            deadline,
+        } => {
+            if deadline.is_some_and(|d| Instant::now() >= d) {
+                WorkResponse::FeedPageCorrelated {
+                    correlation,
+                    batch: Err("feed request deadline exceeded".into()),
+                }
+            } else if correlation.validate().is_err()
+                || correlation.source != format!("{source:?}")
+                || correlation.cursor != cursor
+            {
+                WorkResponse::FeedPageCorrelated {
+                    correlation,
+                    batch: Err("invalid feed correlation".into()),
+                }
+            } else {
+                let response = fetch_feed_page(client, source, cursor);
+                if deadline.is_some_and(|d| Instant::now() >= d) {
+                    return WorkResponse::FeedPageCorrelated {
+                        correlation,
+                        batch: Err("feed request deadline exceeded".into()),
+                    };
+                }
+                let batch = match response {
+                    WorkResponse::FeedPage {
+                        batch: Ok(batch), ..
+                    } => project_page(correlation.clone(), batch.posts, batch.cursor),
+                    WorkResponse::FeedPage {
+                        batch: Err(error), ..
+                    } => Err(error),
+                    _ => unreachable!(),
+                };
+                WorkResponse::FeedPageCorrelated { correlation, batch }
+            }
+        }
         WorkRequest::FetchSavedFeeds => fetch_saved_feeds(client),
         WorkRequest::FetchImage { url } => {
             let bytes = fetch_image_bytes(&url);
@@ -735,29 +909,15 @@ fn handle_request(
         WorkRequest::CreateThread { segments, reply_to } => {
             create_thread(client, segments, reply_to)
         }
-        WorkRequest::CreateLike {
-            post_uri,
-            post_cid,
-        } => create_engagement_record(
-            client,
-            "app.bsky.feed.like",
-            &post_uri,
-            &post_cid,
-            true,
-        ),
+        WorkRequest::CreateLike { post_uri, post_cid } => {
+            create_engagement_record(client, "app.bsky.feed.like", &post_uri, &post_cid, true)
+        }
         WorkRequest::DeleteLike { rkey } => {
             delete_engagement_record(client, "app.bsky.feed.like", &rkey, true)
         }
-        WorkRequest::CreateRepost {
-            post_uri,
-            post_cid,
-        } => create_engagement_record(
-            client,
-            "app.bsky.feed.repost",
-            &post_uri,
-            &post_cid,
-            false,
-        ),
+        WorkRequest::CreateRepost { post_uri, post_cid } => {
+            create_engagement_record(client, "app.bsky.feed.repost", &post_uri, &post_cid, false)
+        }
         WorkRequest::DeleteRepost { rkey } => {
             delete_engagement_record(client, "app.bsky.feed.repost", &rkey, false)
         }
@@ -767,15 +927,9 @@ fn handle_request(
         WorkRequest::DeleteFollow { rkey } => delete_follow(client, &rkey),
         WorkRequest::SearchActors { q, cursor } => search_actors_handler(client, q, cursor),
         WorkRequest::SearchPosts { q, cursor } => search_posts_handler(client, q, cursor),
-        WorkRequest::FetchVideoBlob { did, cid } => {
-            fetch_video_blob(client, did, cid, responses)
-        }
-        WorkRequest::FetchActorFeeds { actor, cursor } => {
-            fetch_actor_feeds(client, actor, cursor)
-        }
-        WorkRequest::FetchActorLists { actor, cursor } => {
-            fetch_actor_lists(client, actor, cursor)
-        }
+        WorkRequest::FetchVideoBlob { did, cid } => fetch_video_blob(client, did, cid, responses),
+        WorkRequest::FetchActorFeeds { actor, cursor } => fetch_actor_feeds(client, actor, cursor),
+        WorkRequest::FetchActorLists { actor, cursor } => fetch_actor_lists(client, actor, cursor),
         WorkRequest::FetchActorStarterPacks { actor, cursor } => {
             fetch_actor_starter_packs(client, actor, cursor)
         }
@@ -783,8 +937,7 @@ fn handle_request(
         WorkRequest::MarkSeen { seen_at } => {
             // Fire-and-forget; the result is logged but not surfaced.
             let input = update_seen::InputData { seen_at }.into();
-            if let Err(e) =
-                agent_call!(client, |a| a.api.app.bsky.notification.update_seen(input))
+            if let Err(e) = agent_call!(client, |a| a.api.app.bsky.notification.update_seen(input))
             {
                 bsky_log::log!("update_seen failed: {e}");
             }
@@ -799,21 +952,13 @@ fn handle_request(
         WorkRequest::GetConvoMessages { convo_id, cursor } => {
             fetch_convo_messages(client, convo_id, cursor)
         }
-        WorkRequest::SendMessage { convo_id, text } => {
-            send_chat_message(client, convo_id, text)
-        }
+        WorkRequest::SendMessage { convo_id, text } => send_chat_message(client, convo_id, text),
         WorkRequest::MarkConvoRead { convo_id } => mark_convo_read(client, convo_id),
-        WorkRequest::GetConvoForMembers { members } => {
-            fetch_convo_for_members(client, members)
-        }
+        WorkRequest::GetConvoForMembers { members } => fetch_convo_for_members(client, members),
     }
 }
 
-fn search_actors_handler(
-    client: &AuthClient,
-    q: String,
-    cursor: Option<String>,
-) -> WorkResponse {
+fn search_actors_handler(client: &AuthClient, q: String, cursor: Option<String>) -> WorkResponse {
     let limit = LimitedNonZeroU8::<100>::try_from(25).expect("25 fits");
     let params = search_actors::ParametersData {
         cursor,
@@ -831,11 +976,7 @@ fn search_actors_handler(
     }
 }
 
-fn search_posts_handler(
-    client: &AuthClient,
-    q: String,
-    cursor: Option<String>,
-) -> WorkResponse {
+fn search_posts_handler(client: &AuthClient, q: String, cursor: Option<String>) -> WorkResponse {
     let limit = LimitedNonZeroU8::<100>::try_from(25).expect("25 fits");
     let params = search_posts::ParametersData {
         author: None,
@@ -868,8 +1009,7 @@ fn fetch_feed_page(
     source: FeedSource,
     cursor: Option<String>,
 ) -> WorkResponse {
-    let limit = LimitedNonZeroU8::<100>::try_from(50)
-        .expect("50 fits in LimitedNonZeroU8<100>");
+    let limit = LimitedNonZeroU8::<100>::try_from(50).expect("50 fits in LimitedNonZeroU8<100>");
     match &source {
         FeedSource::Following => {
             let params = get_timeline::ParametersData {
@@ -933,8 +1073,7 @@ fn fetch_feed_page(
             };
             // include_pins only matters for the first page, and only
             // for posts_and_author_threads (the bsky-app convention).
-            let include_pins = matches!(source, FeedSource::AuthorPosts { .. })
-                && cursor.is_none();
+            let include_pins = matches!(source, FeedSource::AuthorPosts { .. }) && cursor.is_none();
             let params = get_author_feed::ParametersData {
                 actor: at_id,
                 cursor,
@@ -993,13 +1132,8 @@ fn fetch_feed_page(
 
 /// Fetch a page of custom feeds (`GeneratorView`s) created by `actor`.
 /// `actor` is echoed in the response as the staleness key.
-fn fetch_actor_feeds(
-    client: &AuthClient,
-    actor: String,
-    cursor: Option<String>,
-) -> WorkResponse {
-    let limit = LimitedNonZeroU8::<100>::try_from(50)
-        .expect("50 fits in LimitedNonZeroU8<100>");
+fn fetch_actor_feeds(client: &AuthClient, actor: String, cursor: Option<String>) -> WorkResponse {
+    let limit = LimitedNonZeroU8::<100>::try_from(50).expect("50 fits in LimitedNonZeroU8<100>");
     let at_id = match AtIdentifier::from_str(&actor) {
         Ok(id) => id,
         Err(e) => {
@@ -1031,13 +1165,8 @@ fn fetch_actor_feeds(
 }
 
 /// Fetch a page of lists curated by `actor`.
-fn fetch_actor_lists(
-    client: &AuthClient,
-    actor: String,
-    cursor: Option<String>,
-) -> WorkResponse {
-    let limit = LimitedNonZeroU8::<100>::try_from(50)
-        .expect("50 fits in LimitedNonZeroU8<100>");
+fn fetch_actor_lists(client: &AuthClient, actor: String, cursor: Option<String>) -> WorkResponse {
+    let limit = LimitedNonZeroU8::<100>::try_from(50).expect("50 fits in LimitedNonZeroU8<100>");
     let at_id = match AtIdentifier::from_str(&actor) {
         Ok(id) => id,
         Err(e) => {
@@ -1075,8 +1204,7 @@ fn fetch_actor_starter_packs(
     actor: String,
     cursor: Option<String>,
 ) -> WorkResponse {
-    let limit = LimitedNonZeroU8::<100>::try_from(50)
-        .expect("50 fits in LimitedNonZeroU8<100>");
+    let limit = LimitedNonZeroU8::<100>::try_from(50).expect("50 fits in LimitedNonZeroU8<100>");
     let at_id = match AtIdentifier::from_str(&actor) {
         Ok(id) => id,
         Err(e) => {
@@ -1092,7 +1220,13 @@ fn fetch_actor_starter_packs(
         limit: Some(limit),
     }
     .into();
-    match agent_call!(client, |a| a.api.app.bsky.graph.get_actor_starter_packs(params)) {
+    match agent_call!(client, |a| a
+        .api
+        .app
+        .bsky
+        .graph
+        .get_actor_starter_packs(params))
+    {
         Ok(o) => WorkResponse::ActorStarterPacks {
             actor,
             batch: Ok(ActorStarterPacksBatch {
@@ -1193,9 +1327,7 @@ fn fetch_saved_feeds(client: &AuthClient) -> WorkResponse {
                 }
             }
             Err(e) => {
-                bsky_log::log!(
-                    "get_feed_generators failed: {e} — pills will use AT-URI fallbacks"
-                );
+                bsky_log::log!("get_feed_generators failed: {e} — pills will use AT-URI fallbacks");
             }
         }
     }
@@ -1210,13 +1342,12 @@ fn fetch_saved_feeds(client: &AuthClient) -> WorkResponse {
                 avatar_url: None,
             },
             PendingPin::Feed { uri } => {
-                let (display_name, avatar_url) =
-                    hydrated.get(&uri).cloned().unwrap_or_else(|| {
-                        // Fallback: the rkey portion of the AT-URI if hydration
-                        // failed. Better than rendering an empty pill.
-                        let fallback = uri.rsplit('/').next().unwrap_or(&uri).to_string();
-                        (fallback, None)
-                    });
+                let (display_name, avatar_url) = hydrated.get(&uri).cloned().unwrap_or_else(|| {
+                    // Fallback: the rkey portion of the AT-URI if hydration
+                    // failed. Better than rendering an empty pill.
+                    let fallback = uri.rsplit('/').next().unwrap_or(&uri).to_string();
+                    (fallback, None)
+                });
                 SavedFeedPin {
                     source: FeedSource::Feed(uri),
                     display_name,
@@ -1229,8 +1360,7 @@ fn fetch_saved_feeds(client: &AuthClient) -> WorkResponse {
 }
 
 fn fetch_notifications(client: &AuthClient, cursor: Option<String>) -> WorkResponse {
-    let limit = LimitedNonZeroU8::<100>::try_from(50)
-        .expect("50 fits in LimitedNonZeroU8<100>");
+    let limit = LimitedNonZeroU8::<100>::try_from(50).expect("50 fits in LimitedNonZeroU8<100>");
     let params = list_notifications::ParametersData {
         cursor,
         limit: Some(limit),
@@ -1240,11 +1370,11 @@ fn fetch_notifications(client: &AuthClient, cursor: Option<String>) -> WorkRespo
     }
     .into();
     match agent_call!(client, |a| a
-            .api
-            .app
-            .bsky
-            .notification
-            .list_notifications(params))
+        .api
+        .app
+        .bsky
+        .notification
+        .list_notifications(params))
     {
         Ok(o) => WorkResponse::Notifications(Ok(NotificationBatch {
             notifications: o.data.notifications,
@@ -1302,8 +1432,7 @@ fn decode_message_item(u: Union<OutputMessagesItem>) -> Option<MessageItem> {
 
 /// List the user's conversations (most-recent-activity first).
 fn fetch_convos(client: &AuthClient, cursor: Option<String>) -> WorkResponse {
-    let limit = LimitedNonZeroU8::<100>::try_from(50)
-        .expect("50 fits in LimitedNonZeroU8<100>");
+    let limit = LimitedNonZeroU8::<100>::try_from(50).expect("50 fits in LimitedNonZeroU8<100>");
     let params = list_convos::ParametersData {
         cursor,
         limit: Some(limit),
@@ -1312,11 +1441,11 @@ fn fetch_convos(client: &AuthClient, cursor: Option<String>) -> WorkResponse {
     }
     .into();
     match agent_call!(client, |a| a
-            .api_with_proxy(chat_did(), AtprotoServiceType::BskyChat)
-            .chat
-            .bsky
-            .convo
-            .list_convos(params))
+        .api_with_proxy(chat_did(), AtprotoServiceType::BskyChat)
+        .chat
+        .bsky
+        .convo
+        .list_convos(params))
     {
         Ok(o) => WorkResponse::Convos(Ok(ConvosBatch {
             convos: o.data.convos,
@@ -1335,8 +1464,7 @@ fn fetch_convo_messages(
     convo_id: String,
     cursor: Option<String>,
 ) -> WorkResponse {
-    let limit = LimitedNonZeroU8::<100>::try_from(50)
-        .expect("50 fits in LimitedNonZeroU8<100>");
+    let limit = LimitedNonZeroU8::<100>::try_from(50).expect("50 fits in LimitedNonZeroU8<100>");
     let params = get_messages::ParametersData {
         convo_id: convo_id.clone(),
         cursor,
@@ -1344,11 +1472,11 @@ fn fetch_convo_messages(
     }
     .into();
     match agent_call!(client, |a| a
-            .api_with_proxy(chat_did(), AtprotoServiceType::BskyChat)
-            .chat
-            .bsky
-            .convo
-            .get_messages(params))
+        .api_with_proxy(chat_did(), AtprotoServiceType::BskyChat)
+        .chat
+        .bsky
+        .convo
+        .get_messages(params))
     {
         Ok(o) => {
             let mut messages: Vec<MessageItem> = o
@@ -1388,11 +1516,11 @@ fn send_chat_message(client: &AuthClient, convo_id: String, text: String) -> Wor
     }
     .into();
     match agent_call!(client, |a| a
-            .api_with_proxy(chat_did(), AtprotoServiceType::BskyChat)
-            .chat
-            .bsky
-            .convo
-            .send_message(input))
+        .api_with_proxy(chat_did(), AtprotoServiceType::BskyChat)
+        .chat
+        .bsky
+        .convo
+        .send_message(input))
     {
         Ok(view) => WorkResponse::MessageSent {
             convo_id,
@@ -1414,11 +1542,11 @@ fn mark_convo_read(client: &AuthClient, convo_id: String) -> WorkResponse {
     }
     .into();
     match agent_call!(client, |a| a
-            .api_with_proxy(chat_did(), AtprotoServiceType::BskyChat)
-            .chat
-            .bsky
-            .convo
-            .update_read(input))
+        .api_with_proxy(chat_did(), AtprotoServiceType::BskyChat)
+        .chat
+        .bsky
+        .convo
+        .update_read(input))
     {
         Ok(_) => WorkResponse::ConvoRead(Ok(())),
         Err(e) => WorkResponse::ConvoRead(Err(map_chat_err(e))),
@@ -1438,11 +1566,11 @@ fn fetch_convo_for_members(client: &AuthClient, members: Vec<String>) -> WorkRes
     };
     let params = get_convo_for_members::ParametersData { members }.into();
     match agent_call!(client, |a| a
-            .api_with_proxy(chat_did(), AtprotoServiceType::BskyChat)
-            .chat
-            .bsky
-            .convo
-            .get_convo_for_members(params))
+        .api_with_proxy(chat_did(), AtprotoServiceType::BskyChat)
+        .chat
+        .bsky
+        .convo
+        .get_convo_for_members(params))
     {
         Ok(o) => WorkResponse::ConvoForMembers(Ok(o.data.convo)),
         Err(e) => WorkResponse::ConvoForMembers(Err(map_chat_err(e))),
@@ -1492,7 +1620,13 @@ fn create_follow(client: &AuthClient, actor_did: String) -> WorkResponse {
         swap_commit: None,
         validate: None,
     };
-    match agent_call!(client, |a| a.api.com.atproto.repo.create_record(input.into())) {
+    match agent_call!(client, |a| a
+        .api
+        .com
+        .atproto
+        .repo
+        .create_record(input.into()))
+    {
         Ok(o) => WorkResponse::FollowChanged(Ok(Some(o.data.uri))),
         Err(e) => WorkResponse::FollowChanged(Err(format!("{e}"))),
     }
@@ -1522,7 +1656,13 @@ fn delete_follow(client: &AuthClient, rkey_str: &str) -> WorkResponse {
         swap_commit: None,
         swap_record: None,
     };
-    match agent_call!(client, |a| a.api.com.atproto.repo.delete_record(input.into())) {
+    match agent_call!(client, |a| a
+        .api
+        .com
+        .atproto
+        .repo
+        .delete_record(input.into()))
+    {
         Ok(_) => WorkResponse::FollowChanged(Ok(None)),
         Err(e) => WorkResponse::FollowChanged(Err(format!("{e}"))),
     }
@@ -1538,19 +1678,39 @@ fn delete_post(client: &AuthClient, uri: String) -> WorkResponse {
     let rkey_str = uri.rsplit('/').next().unwrap_or("").to_string();
     let did_str = match agent_call!(client, |a| a.did()) {
         Some(d) => d.to_string(),
-        None => return WorkResponse::PostDeleted { uri, result: Err("no session DID".into()) },
+        None => {
+            return WorkResponse::PostDeleted {
+                uri,
+                result: Err("no session DID".into()),
+            }
+        }
     };
     let repo = match AtIdentifier::from_str(&did_str) {
         Ok(id) => id,
-        Err(e) => return WorkResponse::PostDeleted { uri, result: Err(format!("DID parse: {e}")) },
+        Err(e) => {
+            return WorkResponse::PostDeleted {
+                uri,
+                result: Err(format!("DID parse: {e}")),
+            }
+        }
     };
     let collection = match Nsid::from_str("app.bsky.feed.post") {
         Ok(n) => n,
-        Err(e) => return WorkResponse::PostDeleted { uri, result: Err(format!("nsid: {e}")) },
+        Err(e) => {
+            return WorkResponse::PostDeleted {
+                uri,
+                result: Err(format!("nsid: {e}")),
+            }
+        }
     };
     let rkey = match RecordKey::from_str(&rkey_str) {
         Ok(k) => k,
-        Err(e) => return WorkResponse::PostDeleted { uri, result: Err(format!("rkey: {e}")) },
+        Err(e) => {
+            return WorkResponse::PostDeleted {
+                uri,
+                result: Err(format!("rkey: {e}")),
+            }
+        }
     };
     let input = delete_record::InputData {
         collection,
@@ -1559,9 +1719,21 @@ fn delete_post(client: &AuthClient, uri: String) -> WorkResponse {
         swap_commit: None,
         swap_record: None,
     };
-    match agent_call!(client, |a| a.api.com.atproto.repo.delete_record(input.into())) {
-        Ok(_) => WorkResponse::PostDeleted { uri, result: Ok(()) },
-        Err(e) => WorkResponse::PostDeleted { uri, result: Err(format!("{e}")) },
+    match agent_call!(client, |a| a
+        .api
+        .com
+        .atproto
+        .repo
+        .delete_record(input.into()))
+    {
+        Ok(_) => WorkResponse::PostDeleted {
+            uri,
+            result: Ok(()),
+        },
+        Err(e) => WorkResponse::PostDeleted {
+            uri,
+            result: Err(format!("{e}")),
+        },
     }
 }
 
@@ -1587,9 +1759,9 @@ fn fetch_thread(client: &AuthClient, uri: String) -> WorkResponse {
                         items
                             .iter()
                             .filter_map(|item| match item {
-                                Union::Refs(ThreadViewPostRepliesItem::ThreadViewPost(
-                                    child,
-                                )) => Some(child.post.clone()),
+                                Union::Refs(ThreadViewPostRepliesItem::ThreadViewPost(child)) => {
+                                    Some(child.post.clone())
+                                }
                                 _ => None,
                             })
                             .collect()
@@ -1607,9 +1779,7 @@ fn fetch_thread(client: &AuthClient, uri: String) -> WorkResponse {
             Union::Refs(OutputThreadRefs::AppBskyFeedDefsBlockedPost(_)) => {
                 WorkResponse::Thread(Err("post is blocked".into()))
             }
-            Union::Unknown(_) => {
-                WorkResponse::Thread(Err("unsupported thread variant".into()))
-            }
+            Union::Unknown(_) => WorkResponse::Thread(Err("unsupported thread variant".into())),
         },
         Err(e) => WorkResponse::Thread(Err(format!("{e}"))),
     }
@@ -1617,10 +1787,7 @@ fn fetch_thread(client: &AuthClient, uri: String) -> WorkResponse {
 
 /// Walk the parent chain of a `ThreadViewPost` and push each ancestor
 /// into `out` (newest-first; caller reverses for oldest-first).
-fn walk_parents(
-    view: &atrium_api::app::bsky::feed::defs::ThreadViewPost,
-    out: &mut Vec<PostView>,
-) {
+fn walk_parents(view: &atrium_api::app::bsky::feed::defs::ThreadViewPost, out: &mut Vec<PostView>) {
     if let Some(Union::Refs(ThreadViewPostParentRefs::ThreadViewPost(parent))) =
         view.parent.as_ref()
     {
@@ -1702,7 +1869,13 @@ fn create_engagement_record(
         swap_commit: None,
         validate: None,
     };
-    match agent_call!(client, |a| a.api.com.atproto.repo.create_record(input.into())) {
+    match agent_call!(client, |a| a
+        .api
+        .com
+        .atproto
+        .repo
+        .create_record(input.into()))
+    {
         Ok(o) => wrap_engagement_ok(is_like, Some(o.data.uri)),
         Err(e) => wrap_engagement_err(is_like, format!("{e}")),
     }
@@ -1738,7 +1911,13 @@ fn delete_engagement_record(
         swap_commit: None,
         swap_record: None,
     };
-    match agent_call!(client, |a| a.api.com.atproto.repo.delete_record(input.into())) {
+    match agent_call!(client, |a| a
+        .api
+        .com
+        .atproto
+        .repo
+        .delete_record(input.into()))
+    {
         Ok(_) => wrap_engagement_ok(is_like, None),
         Err(e) => wrap_engagement_err(is_like, format!("{e}")),
     }
@@ -1845,7 +2024,8 @@ fn create_one_post(
     }
     let unknown: Unknown =
         serde_json::from_value(json).map_err(|e| format!("re-deserialize: {e}"))?;
-    let collection = Nsid::from_str("app.bsky.feed.post").map_err(|e| format!("nsid parse: {e}"))?;
+    let collection =
+        Nsid::from_str("app.bsky.feed.post").map_err(|e| format!("nsid parse: {e}"))?;
     let input = create_record::InputData {
         collection,
         record: unknown,
@@ -1854,8 +2034,13 @@ fn create_one_post(
         swap_commit: None,
         validate: None,
     };
-    let o = agent_call!(client, |a| a.api.com.atproto.repo.create_record(input.into()))
-        .map_err(|e| format!("{e}"))?;
+    let o = agent_call!(client, |a| a
+        .api
+        .com
+        .atproto
+        .repo
+        .create_record(input.into()))
+    .map_err(|e| format!("{e}"))?;
     Ok((o.data.uri, o.data.cid))
 }
 
@@ -1904,24 +2089,26 @@ fn create_thread(
     let mut first_uri: Option<String> = None;
     for (i, seg) in segments.into_iter().enumerate() {
         let reply = match (&root, &parent) {
-            (Some((ru, rc)), Some((pu, pc))) => {
-                Some(build_reply_ref(ru.clone(), rc.clone(), pu.clone(), pc.clone()))
-            }
+            (Some((ru, rc)), Some((pu, pc))) => Some(build_reply_ref(
+                ru.clone(),
+                rc.clone(),
+                pu.clone(),
+                pc.clone(),
+            )),
             // First post of a brand-new top-level thread: no reply ref.
             _ => None,
         };
-        let (uri, cid) =
-            match create_one_post(client, repo.clone(), seg.text, reply, seg.images) {
-                Ok(v) => v,
-                Err(e) => {
-                    let msg = if i == 0 {
-                        e
-                    } else {
-                        format!("posted {i}/{total}, then failed: {e}")
-                    };
-                    return WorkResponse::PostCreated(Err(msg));
-                }
-            };
+        let (uri, cid) = match create_one_post(client, repo.clone(), seg.text, reply, seg.images) {
+            Ok(v) => v,
+            Err(e) => {
+                let msg = if i == 0 {
+                    e
+                } else {
+                    format!("posted {i}/{total}, then failed: {e}")
+                };
+                return WorkResponse::PostCreated(Err(msg));
+            }
+        };
         if first_uri.is_none() {
             first_uri = Some(uri.clone());
         }

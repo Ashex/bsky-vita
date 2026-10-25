@@ -65,7 +65,9 @@ enum VideoState {
     Downloading,
     /// File is on disk; the player isn't open yet (open happens on
     /// the next frame to keep one heavy operation per tick).
-    Ready { file_path: String },
+    Ready {
+        file_path: String,
+    },
     Playing {
         player: VideoPlayer,
         audio: AudioOut,
@@ -184,17 +186,28 @@ impl VideoPlayerScreen {
         let box_y = py + ph - 102.0;
         let check_rect = Rect::new(box_x, box_y - 4.0, 300.0, box_sz + 8.0);
         let pressed_now = ctx.touches.iter().any(|t| check_rect.contains(t.x, t.y));
-        let toggled =
-            self.notice_check.pressed_last && !pressed_now && ctx.touches.is_empty();
+        let toggled = self.notice_check.pressed_last && !pressed_now && ctx.touches.is_empty();
         self.notice_check.pressed_last = pressed_now;
         if toggled {
             self.notice_dont_show = !self.notice_dont_show;
         }
         // Box: muted border, BACKGROUND interior, ACCENT fill when ticked.
         frame.fill_rect(box_x, box_y, box_sz, box_sz, theme::TEXT_MUTED);
-        frame.fill_rect(box_x + 2.0, box_y + 2.0, box_sz - 4.0, box_sz - 4.0, theme::BACKGROUND);
+        frame.fill_rect(
+            box_x + 2.0,
+            box_y + 2.0,
+            box_sz - 4.0,
+            box_sz - 4.0,
+            theme::BACKGROUND,
+        );
         if self.notice_dont_show {
-            frame.fill_rect(box_x + 6.0, box_y + 6.0, box_sz - 12.0, box_sz - 12.0, theme::ACCENT);
+            frame.fill_rect(
+                box_x + 6.0,
+                box_y + 6.0,
+                box_sz - 12.0,
+                box_sz - 12.0,
+                theme::ACCENT,
+            );
         }
         frame.draw_text(
             font,
@@ -207,7 +220,15 @@ impl VideoPlayerScreen {
 
         // Got-it button + CROSS/CIRCLE all dismiss.
         let ok_rect = Rect::new(px + pw - 160.0, py + ph - 60.0, 136.0, 40.0);
-        let ok_clicked = button(frame, font, ok_rect, "Got it", &mut self.notice_ok_btn, ctx, true);
+        let ok_clicked = button(
+            frame,
+            font,
+            ok_rect,
+            "Got it",
+            &mut self.notice_ok_btn,
+            ctx,
+            true,
+        );
         if ok_clicked || ctx.pad.just_pressed(buttons::CROSS) {
             self.dismiss_notice();
         }
@@ -283,8 +304,15 @@ impl Screen for VideoPlayerScreen {
         let notice_up = self.show_notice;
 
         // Playing-state input handling + frame pulls.
-        if let VideoState::Playing { player, audio, tex, grey_tex, greyscale, tex_w, tex_h } =
-            &mut self.state
+        if let VideoState::Playing {
+            player,
+            audio,
+            tex,
+            grey_tex,
+            greyscale,
+            tex_w,
+            tex_h,
+        } = &mut self.state
         {
             if !notice_up && ctx.pad.just_pressed(buttons::SQUARE) {
                 match player.state() {
@@ -363,7 +391,9 @@ impl Screen for VideoPlayerScreen {
             // Two chunks ≈ ~40 ms of audio, leaves plenty of headroom
             // for the next 16 ms render budget.
             for _ in 0..2 {
-                let Some(chunk) = player.next_audio_samples() else { break };
+                let Some(chunk) = player.next_audio_samples() else {
+                    break;
+                };
                 if let Err(e) = audio.write(&chunk) {
                     bsky_log::log!("audio write failed: {e}");
                     break;
@@ -373,7 +403,13 @@ impl Screen for VideoPlayerScreen {
 
         // ─── Render ─────────────────────────────────────────────────
         // Background fill (letterbox bars stay this color).
-        frame.fill_rect(0.0, 0.0, SCREEN_WIDTH as f32, SCREEN_HEIGHT as f32, theme::BACKGROUND);
+        frame.fill_rect(
+            0.0,
+            0.0,
+            SCREEN_WIDTH as f32,
+            SCREEN_HEIGHT as f32,
+            theme::BACKGROUND,
+        );
 
         match &self.state {
             VideoState::Pending | VideoState::Downloading => {
@@ -430,7 +466,15 @@ impl Screen for VideoPlayerScreen {
                     "Opening…",
                 );
             }
-            VideoState::Playing { player, tex, grey_tex, greyscale, tex_w, tex_h, .. } => {
+            VideoState::Playing {
+                player,
+                tex,
+                grey_tex,
+                greyscale,
+                tex_w,
+                tex_h,
+                ..
+            } => {
                 let (s, _sy, dx, dy, dw, dh) = aspect_fit(*tex_w, *tex_h);
                 if *greyscale {
                     // No-shader fallback: RGBA8 luma texture (Y spread to
@@ -489,7 +533,11 @@ impl Screen for VideoPlayerScreen {
                     Err(e) => VideoState::Error(e),
                 };
             }
-            WorkResponse::VideoBlobProgress { cid, downloaded, total } if cid == self.cid => {
+            WorkResponse::VideoBlobProgress {
+                cid,
+                downloaded,
+                total,
+            } if cid == self.cid => {
                 self.dl_done = downloaded;
                 self.dl_total = total;
             }
@@ -521,7 +569,13 @@ fn draw_transport(frame: &mut Frame, font: &Font, player: &VideoPlayer) {
     const BAR_H: i32 = 36;
     let bar_y = SCREEN_HEIGHT - BAR_H;
     // Translucent background bar (no real alpha — matches FIELD_BG).
-    frame.fill_rect(0.0, bar_y as f32, SCREEN_WIDTH as f32, BAR_H as f32, theme::FIELD_BG);
+    frame.fill_rect(
+        0.0,
+        bar_y as f32,
+        SCREEN_WIDTH as f32,
+        BAR_H as f32,
+        theme::FIELD_BG,
+    );
     let now = player.current_time_us();
     let label = format!(
         "{}  ·  {}",
@@ -532,14 +586,7 @@ fn draw_transport(frame: &mut Frame, font: &Font, player: &VideoPlayer) {
             PlayerState::Eof => "ended",
         }
     );
-    frame.draw_text(
-        font,
-        12,
-        bar_y + 24,
-        theme::TEXT_PRIMARY,
-        0.95,
-        &label,
-    );
+    frame.draw_text(font, 12, bar_y + 24, theme::TEXT_PRIMARY, 0.95, &label);
     let hint = "SQUARE pause   ◄ ► seek 10s   CIRCLE back";
     let (hw, _) = frame.measure_text(font, 0.85, hint);
     frame.draw_text(

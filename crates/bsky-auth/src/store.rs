@@ -15,9 +15,9 @@
 //! - [`AtpSessionStore`](atrium_api::agent::atp_agent::store::AtpSessionStore) —
 //!   marker that combines the two.
 
-use atrium_api::agent::AuthorizationProvider;
-use atrium_api::agent::atp_agent::AtpSession;
 use atrium_api::agent::atp_agent::store::AtpSessionStore;
+use atrium_api::agent::atp_agent::AtpSession;
+use atrium_api::agent::AuthorizationProvider;
 use atrium_common::store::Store;
 use atrium_xrpc::types::AuthorizationToken;
 use std::future::Future;
@@ -74,7 +74,11 @@ impl FileSessionStore {
         let path = path.into();
         let cached = Mutex::new(load_from_disk(&path));
         let generation = bsky_oauth::atomic_json::current_session_generation();
-        Self { path, cached, generation }
+        Self {
+            path,
+            cached,
+            generation,
+        }
     }
 
     /// Has the store been loaded with an existing session? (Cheap read.)
@@ -185,13 +189,15 @@ impl AuthorizationProvider for FileSessionStore {
             .cached
             .lock()
             .ok()
-            .and_then(|guard| guard.as_ref().map(|s| {
-                if is_refresh {
-                    s.data.refresh_jwt.clone()
-                } else {
-                    s.data.access_jwt.clone()
-                }
-            }))
+            .and_then(|guard| {
+                guard.as_ref().map(|s| {
+                    if is_refresh {
+                        s.data.refresh_jwt.clone()
+                    } else {
+                        s.data.access_jwt.clone()
+                    }
+                })
+            })
             .map(AuthorizationToken::Bearer);
         async move { token }
     }
@@ -229,10 +235,11 @@ mod tests {
         let store = FileSessionStore::new(&path);
         assert!(!store.has_session());
         let session = dummy_session();
-        let result =
-            futures::executor::block_on(<FileSessionStore as Store<(), AtpSession>>::set(
-                &store, (), session.clone(),
-            ));
+        let result = futures::executor::block_on(<FileSessionStore as Store<(), AtpSession>>::set(
+            &store,
+            (),
+            session.clone(),
+        ));
         assert!(result.is_ok(), "set: {result:?}");
         assert!(store.has_session());
         assert!(path.exists());
@@ -240,9 +247,10 @@ mod tests {
         // Read back from a fresh instance
         let store2 = FileSessionStore::new(&path);
         assert!(store2.has_session());
-        let got = futures::executor::block_on(
-            <FileSessionStore as Store<(), AtpSession>>::get(&store2, &()),
-        )
+        let got = futures::executor::block_on(<FileSessionStore as Store<(), AtpSession>>::get(
+            &store2,
+            &(),
+        ))
         .expect("get ok")
         .expect("session present");
         assert_eq!(got.data.access_jwt, "access-jwt-1");
@@ -256,7 +264,9 @@ mod tests {
         let store = FileSessionStore::new(&path);
         let session = dummy_session();
         futures::executor::block_on(<FileSessionStore as Store<(), AtpSession>>::set(
-            &store, (), session,
+            &store,
+            (),
+            session,
         ))
         .expect("set");
 
@@ -278,12 +288,15 @@ mod tests {
         let path = dir.path().join("session.json");
         let store = FileSessionStore::new(&path);
         futures::executor::block_on(<FileSessionStore as Store<(), AtpSession>>::set(
-            &store, (), dummy_session(),
+            &store,
+            (),
+            dummy_session(),
         ))
         .expect("set");
         assert!(path.exists());
         futures::executor::block_on(<FileSessionStore as Store<(), AtpSession>>::del(
-            &store, &(),
+            &store,
+            &(),
         ))
         .expect("del");
         assert!(!path.exists());

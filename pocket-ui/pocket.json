@@ -1,0 +1,21 @@
+{
+  "$schema": "https://pocketjs.dev/schema/pocket-2.json",
+  "pocket": 2,
+  "id": "dev.bsky-vita.timeline-probe",
+  "name": "bsky-vita-timeline-probe",
+  "title": "bsky-vita Solid Timeline Probe",
+  "version": "0.1.0",
+  "engine": {
+    "capabilities": {
+      "requires": ["text.glyphs.baked", "input.buttons"]
+    }
+  },
+  "app": {
+    "entry": "src/main.tsx",
+    "output": "timeline-probe",
+    "framework": "solid",
+    "viewport": {
+      "fixed": { "logical": [480, 272], "presentation": "integer-fit" }
+    }
+  }
+}

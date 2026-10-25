@@ -36,13 +36,8 @@ use crate::widget::UiCtx;
 pub trait Screen {
     /// Render this frame and update widget state. Return a transition
     /// action consumed by main.rs after the frame is presented.
-    fn frame(
-        &mut self,
-        frame: &mut Frame,
-        font: &Font,
-        ctx: &UiCtx,
-        ime: &mut Ime,
-    ) -> ScreenAction;
+    fn frame(&mut self, frame: &mut Frame, font: &Font, ctx: &UiCtx, ime: &mut Ime)
+        -> ScreenAction;
 
     /// Update screen state from a worker response. Default no-op for
     /// screens that don't dispatch work (e.g. LoginScreen).

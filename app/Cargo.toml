@@ -15,7 +15,13 @@ assets = "static"
 # vita-mksfoex flags default to ATTRIBUTE2=12 (bumps MAIN heap budget to 365 MiB),
 # inherited from cargo-vita defaults. Override via `vita_mksfoex_flags = [...]` if needed.
 
+[features]
+default = []
+pocketjs-poc = ["dep:bsky-pocket"]
+
 [dependencies]
+bsky-feed = { path = "../crates/bsky-feed" }
+bsky-pocket = { path = "../crates/bsky-pocket", optional = true }
 vitasdk-sys = { workspace = true }
 vita-newlib-shims = { workspace = true }
 

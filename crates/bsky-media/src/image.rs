@@ -71,11 +71,8 @@ fn decode_png(bytes: &[u8]) -> Result<(Vec<u8>, u32, u32), String> {
     unsafe {
         let mut img: PngImage = core::mem::zeroed();
         img.version = PNG_IMAGE_VERSION;
-        if png_image_begin_read_from_memory(
-            &mut img,
-            bytes.as_ptr() as *const c_void,
-            bytes.len(),
-        ) == 0
+        if png_image_begin_read_from_memory(&mut img, bytes.as_ptr() as *const c_void, bytes.len())
+            == 0
         {
             return Err("png_image_begin_read_from_memory failed".into());
         }

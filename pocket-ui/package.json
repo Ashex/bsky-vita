@@ -1,0 +1,21 @@
+{
+  "name": "bsky-vita-pocket-probe",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "package": "bun ../vendor/pocketjs/tools/pocket-pack.ts build --manifest ./pocket.json --project-root . --target vita -o ./dist/timeline-probe.pocket",
+    "build": "bun run package",
+    "check": "tsc --noEmit && bun run build",
+    "test": "bun run package && bun test tests/*.test.ts && node --test tests/*.test.mjs"
+  },
+  "dependencies": {
+    "@pocketjs/framework": "file:../vendor/pocketjs",
+    "solid-js": "1.9.9"
+  },
+  "devDependencies": {
+    "@types/node": "22.15.30",
+    "typescript": "5.8.3",
+    "vite": "6.3.5",
+    "vite-plugin-solid": "2.11.6"
+  }
+}
