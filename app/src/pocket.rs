@@ -1,4 +1,5 @@
 use bsky_input::{buttons, PadFrame};
+use bsky_pocket::text_batch::pack_lines;
 use bsky_pocket::{EmbeddedGuest, NativeCommand};
 use bsky_render::{Font, Frame, Texture};
 
@@ -13,6 +14,10 @@ pub struct PocketShell {
     auth_generation: u64,
     mount_generation: u64,
     layout_id: u64,
+    wrap_cache: bsky_pocket::visible_text::WrapCache,
+    measurement_queue: std::collections::VecDeque<String>,
+    measured_lines: std::collections::HashMap<String, (std::sync::Arc<Vec<String>>, bool)>,
+    measured_widths: std::collections::HashMap<(String, u64), u16>,
     pending_delivery: Option<bsky_feed::FeedDelivery>,
     pending_status: Option<String>,
 }
@@ -35,6 +40,10 @@ impl PocketShell {
             auth_generation: 0,
             mount_generation: 0,
             layout_id: 0,
+            wrap_cache: bsky_pocket::visible_text::WrapCache::default(),
+            measurement_queue: std::collections::VecDeque::new(),
+            measured_lines: std::collections::HashMap::new(),
+            measured_widths: std::collections::HashMap::new(),
             pending_delivery: None,
             pending_status: None,
         })
@@ -48,6 +57,10 @@ impl PocketShell {
     }
     fn reset_local(&mut self) {
         self.authorized_stamp = None;
+        self.wrap_cache.clear();
+        self.measurement_queue.clear();
+        self.measured_lines.clear();
+        self.measured_widths.clear();
         self.native_batch
             .commands
             .retain(|c| !matches!(c, NativeCommand::Text { stamp: Some(_), .. }));
@@ -55,6 +68,10 @@ impl PocketShell {
     pub fn bind_auth(&mut self, generation: u64) -> Vec<bsky_feed::FeedEffect> {
         if self.auth_generation != generation {
             self.auth_generation = generation;
+            self.wrap_cache.clear();
+            self.measurement_queue.clear();
+            self.measured_lines.clear();
+            self.measured_widths.clear();
             let effects = self.coordinator.lock().unwrap().auth_changed(generation);
             self.accept_effects(effects.clone());
             effects
@@ -80,6 +97,10 @@ impl PocketShell {
                 }
                 bsky_feed::FeedEffect::InvalidatePresentation => {
                     self.authorized_stamp = None;
+                    self.wrap_cache.clear();
+                    self.measurement_queue.clear();
+                    self.measured_lines.clear();
+                    self.measured_widths.clear();
                     self.native_batch.commands.clear();
                 }
             }
@@ -255,12 +276,7 @@ impl PocketShell {
         }
         let (revision, rows) = {
             let coordinator = self.coordinator.lock().unwrap();
-            let history: Vec<String> = coordinator
-                .history()
-                .posts()
-                .iter()
-                .map(|post| post.uri.clone())
-                .collect();
+            let history = coordinator.history().posts();
             let _ = self.guest.set_global_json(
                 "__bskyAuthGeneration",
                 &self.auth_generation.max(1).to_string(),
@@ -283,6 +299,7 @@ impl PocketShell {
             let proposed: Option<MeasureRequest> = serde_json::from_str(&raw).ok();
             let requested = proposed
                 .filter(|request| request.validate().is_ok())
+                .filter(|request| !request.rows.is_empty())
                 .filter(|request| {
                     request.stamp.auth_generation == self.auth_generation.max(1)
                         && request.stamp.mount_generation == self.mount_generation.max(1)
@@ -290,15 +307,82 @@ impl PocketShell {
                 })
                 .and_then(|request| {
                     let uris: Vec<String> = request.rows.into_iter().map(|row| row.uri).collect();
-                    bsky_pocket::visible_text::validate_window(&history, &uris)
+                    let start = history.iter().position(|post| post.uri == uris[0])?;
+                    let window: Vec<_> = history.iter().skip(start).take(uris.len()).collect();
+                    (window.len() == uris.len()
+                        && window.iter().zip(&uris).all(|(post, uri)| post.uri == *uri))
+                    .then(|| uris)
                 });
-            let rows = requested.unwrap_or_else(|| {
-                history
-                    .iter()
-                    .take(bsky_pocket::visible_text::MAX_ROWS)
-                    .cloned()
-                    .collect()
+            // Refresh a bounded, ordered work queue from the current viewport.
+            // Rotating its head after each frame prevents long posts from starving
+            // later rows while preserving the three-row admission cap.
+            let requested = requested.unwrap_or_else(|| {
+                let layout_raw = self
+                    .guest
+                    .eval_global_with_deadline(
+                        "globalThis.__bskyVisibleLayoutRequest || ''",
+                        deadline,
+                    )
+                    .unwrap_or_default();
+                let layout: Option<MeasureRequest> = serde_json::from_str(&layout_raw).ok();
+                layout
+                    .filter(|layout| {
+                        layout.validate().is_ok()
+                            && layout.stamp.auth_generation == self.auth_generation.max(1)
+                            && layout.stamp.mount_generation == self.mount_generation.max(1)
+                            && layout.stamp.history_revision
+                                == coordinator.history_revision().max(1)
+                    })
+                    .filter(|layout| {
+                        layout
+                            .rows
+                            .iter()
+                            .all(|row| history.iter().any(|post| post.uri == row.uri))
+                    })
+                    .map(|layout| layout.rows.into_iter().map(|row| row.uri).collect())
+                    .unwrap_or_default()
             });
+            self.measurement_queue.retain(|uri| requested.contains(uri));
+            for uri in requested {
+                if !self.measurement_queue.contains(&uri) {
+                    self.measurement_queue.push_back(uri);
+                }
+            }
+            self.measurement_queue
+                .truncate(bsky_pocket::visible_text::MAX_LAYOUT_ROWS);
+            let revision = coordinator.history_revision().max(1);
+            let layout_raw = self
+                .guest
+                .eval_global_with_deadline("globalThis.__bskyVisibleLayoutRequest || ''", deadline)
+                .unwrap_or_default();
+            let layout_request: Option<MeasureRequest> = serde_json::from_str(&layout_raw).ok();
+            if let Some(layout) = layout_request.filter(|layout| {
+                layout.validate().is_ok()
+                    && layout.stamp.auth_generation == self.auth_generation.max(1)
+                    && layout.stamp.mount_generation == self.mount_generation.max(1)
+                    && layout.stamp.history_revision == revision
+            }) {
+                if layout
+                    .rows
+                    .iter()
+                    .all(|row| history.iter().any(|post| post.uri == row.uri))
+                {
+                    self.guest
+                        .set_global_json(
+                            "__bskyVisibleLayoutRequest",
+                            &serde_json::to_string(&layout)
+                                .map_err(|_| "layout serialization failed")?,
+                            deadline,
+                        )
+                        .ok();
+                }
+            }
+            let rows: Vec<String> = self
+                .measurement_queue
+                .iter()
+                .take(bsky_pocket::visible_text::MAX_MEASURE_BATCH)
+                .cloned()
+                .collect();
             let rows: Vec<bsky_pocket::visible_text::MeasureRow> = rows
                 .iter()
                 .map(|uri| bsky_pocket::visible_text::MeasureRow {
@@ -308,52 +392,84 @@ impl PocketShell {
                 .collect();
             (coordinator.history_revision().max(1), rows)
         };
-        if rows.is_empty() {
-            self.authorized_stamp = None;
-            self.framebuffer_texture = None;
-            self.native_batch
-                .commands
-                .retain(|c| !matches!(c, NativeCommand::Text { stamp: Some(_), .. }));
-            return Ok(());
-        }
-        self.layout_id = self.layout_id.wrapping_add(1).max(1);
-        let request = MeasureRequest {
-            schema: bsky_pocket::visible_text::VISIBLE_SCHEMA,
-            stamp: Stamp {
-                auth_generation: self.auth_generation.max(1),
-                mount_generation: self.mount_generation.max(1),
-                history_revision: revision,
-                layout_id: self.layout_id,
-            },
-            rows,
+        let needs_measurement = !rows.is_empty()
+            && rows
+                .iter()
+                .any(|row| !self.measured_lines.contains_key(&row.uri));
+        let request = if needs_measurement {
+            self.layout_id = self.layout_id.wrapping_add(1).max(1);
+            let request = MeasureRequest {
+                schema: bsky_pocket::visible_text::VISIBLE_SCHEMA,
+                stamp: Stamp {
+                    auth_generation: self.auth_generation.max(1),
+                    mount_generation: self.mount_generation.max(1),
+                    history_revision: revision,
+                    layout_id: self.layout_id,
+                },
+                rows,
+            };
+            request.validate().map_err(str::to_string)?;
+            let json = serde_json::to_string(&request)
+                .map_err(|_| "visible text request serialization failed")?;
+            self.guest
+                .set_global_json("__bskyVisibleRequest", &json, deadline)?;
+            let raw = self.guest.eval_global_with_deadline(
+                "globalThis.__bskyVisibleCandidates(JSON.stringify(globalThis.__bskyVisibleRequest))",
+                deadline,
+            )?;
+            if raw.is_empty() {
+                return Ok(());
+            }
+            let candidates: serde_json::Value =
+                serde_json::from_str(&raw).map_err(|_| "invalid visible candidates")?;
+            if candidates.get("stamp") != Some(&serde_json::to_value(&request.stamp).unwrap()) {
+                return Ok(());
+            }
+            let values = candidates
+                .get("rows")
+                .and_then(serde_json::Value::as_array)
+                .ok_or("invalid visible rows")?;
+            if values.len() != request.rows.len() {
+                return Ok(());
+            }
+            Some((request, values.clone()))
+        } else {
+            None
         };
-        request.validate().map_err(str::to_string)?;
-        let json = serde_json::to_string(&request)
-            .map_err(|_| "visible text request serialization failed")?;
-        self.guest
-            .set_global_json("__bskyVisibleRequest", &json, deadline)?;
-        let raw = self.guest.eval_global_with_deadline(
-            "globalThis.__bskyVisibleCandidates(JSON.stringify(globalThis.__bskyVisibleRequest))",
-            deadline,
-        )?;
-        if raw.is_empty() {
-            return Ok(());
-        }
-        let candidates: serde_json::Value =
-            serde_json::from_str(&raw).map_err(|_| "invalid visible candidates")?;
-        if candidates.get("stamp") != Some(&serde_json::to_value(&request.stamp).unwrap()) {
-            return Ok(());
-        }
-        let values = candidates
-            .get("rows")
-            .and_then(serde_json::Value::as_array)
-            .ok_or("invalid visible rows")?;
-        if values.len() != request.rows.len() {
-            return Ok(());
-        }
+        let (request, values) = request.unwrap_or_else(|| {
+            (
+                MeasureRequest {
+                    schema: bsky_pocket::visible_text::VISIBLE_SCHEMA,
+                    stamp: Stamp {
+                        auth_generation: self.auth_generation.max(1),
+                        mount_generation: self.mount_generation.max(1),
+                        history_revision: revision,
+                        layout_id: self.layout_id.max(1),
+                    },
+                    rows: Vec::new(),
+                },
+                Vec::new(),
+            )
+        });
         let mut results = Vec::new();
         let mut lines_by_row = Vec::new();
-        let mut total_calls = 0usize;
+        let mut budget = bsky_pocket::visible_text::MeasureBudget::new(
+            bsky_pocket::visible_text::MAX_MEASURE_CALLS_TOTAL,
+            bsky_pocket::visible_text::MAX_MEASURE_BYTES_TOTAL,
+        );
+        let mut provider_budget = bsky_pocket::visible_text::MeasureBudget::new(
+            bsky_pocket::visible_text::MAX_MEASURE_CALLS_TOTAL,
+            bsky_pocket::visible_text::MAX_MEASURE_BYTES_TOTAL,
+        );
+        let font_key = font as *const Font as usize as u64;
+        if !provider_budget.charge(2) {
+            return Ok(());
+        }
+        let (_, native_height) = bsky_render::measure_native_text(font, 1.5, "Ag");
+        let metric_line_height = (((native_height.max(0).saturating_add(1) / 2).saturating_add(1))
+            & !1)
+            .clamp(1, u16::MAX as i32) as u16;
+        let mut pending_uri = None;
         for (candidate, expected) in values.iter().zip(&request.rows) {
             if std::time::Instant::now() >= deadline {
                 return Ok(());
@@ -369,7 +485,7 @@ impl PocketShell {
                 .get("text")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("");
-            if text.len() > bsky_pocket::visible_text::MAX_TEXT_BYTES {
+            if text.len() > bsky_pocket::visible_text::MAX_INPUT_BYTES_ROW {
                 return Ok(());
             }
             let status = match candidate.get("status").and_then(serde_json::Value::as_str) {
@@ -378,39 +494,41 @@ impl PocketShell {
                 _ => return Ok(()),
             };
             let (lines, continuation) = if status == MeasureStatus::Placeholder {
-                (vec!["Content unavailable".to_string()], false)
+                (
+                    std::sync::Arc::new(vec!["Content unavailable".to_string()]),
+                    false,
+                )
             } else {
-                let mut calls = 0;
-                let wrapped = bsky_pocket::visible_text::wrap_bounded(
+                let wrapped = self.wrap_cache.step(
+                    uri,
                     text,
-                    expected.width.saturating_mul(2),
+                    expected.width,
+                    font_key,
+                    &mut budget,
                     |line| {
-                        if std::time::Instant::now() >= deadline {
-                            return u16::MAX;
+                        if std::time::Instant::now() >= deadline
+                            || !provider_budget.charge(line.len())
+                        {
+                            return None;
                         }
-                        calls += 1;
-                        total_calls += 1;
-                        bsky_render::measure_native_text(font, 1.5, line)
-                            .0
-                            .max(0)
-                            .min(u16::MAX as i32) as u16
+                        Some(
+                            ((bsky_render::measure_native_text(font, 1.5, line)
+                                .0
+                                .max(0)
+                                .saturating_add(1)
+                                / 2)
+                            .min(u16::MAX as i32)) as u16,
+                        )
                     },
                 );
-                if calls > bsky_pocket::visible_text::MAX_MEASURE_CALLS_ROW
-                    || total_calls > bsky_pocket::visible_text::MAX_MEASURE_CALLS_TOTAL
-                {
-                    return Ok(());
-                }
-                (wrapped.0.into_iter().take(2).collect::<Vec<_>>(), wrapped.1)
+                let Some((lines, continuation)) = wrapped else {
+                    pending_uri = Some(uri.to_owned());
+                    break;
+                };
+                (lines, continuation)
             };
-            if lines.iter().map(String::len).sum::<usize>()
-                > bsky_pocket::visible_text::MAX_ROW_BYTES
-            {
-                return Ok(());
-            }
-            let count = lines.len() as u8;
-            let (_, native_height) = bsky_render::measure_native_text(font, 0.75, "Ag");
-            let line_height = native_height.clamp(1, u16::MAX as i32) as u16;
+            let count = u32::try_from(lines.len()).map_err(|_| "line count overflow")?;
+            let line_height = metric_line_height;
             let baseline_offset = line_height;
             results.push(MeasureResult {
                 uri: uri.into(),
@@ -419,24 +537,42 @@ impl PocketShell {
                 line_count: count,
                 line_height,
                 baseline_offset,
-                body_height: (count as u16 * line_height).max(line_height),
+                body_height: count
+                    .checked_mul(u32::from(line_height))
+                    .ok_or("body height overflow")?
+                    .max(u32::from(line_height)),
+
                 continuation,
             });
+            self.measured_lines
+                .insert(uri.to_owned(), (lines.clone(), continuation));
             lines_by_row.push(lines);
+            self.measurement_queue.retain(|queued| queued != uri);
+        }
+        if let Some(uri) = pending_uri {
+            if let Some(index) = self
+                .measurement_queue
+                .iter()
+                .position(|queued| queued == &uri)
+            {
+                self.measurement_queue.rotate_left(index + 1);
+            }
         }
         let reply = MeasureReply {
             schema: bsky_pocket::visible_text::VISIBLE_SCHEMA,
             stamp: request.stamp.clone(),
             rows: results,
         };
-        reply.validate_for(&request).map_err(str::to_string)?;
-        let encoded = reply.to_bounded_json().map_err(str::to_string)?;
-        self.guest
-            .set_global_json("__bskyVisibleMeasurement", &encoded, deadline)?;
-        self.guest.eval_global_with_deadline(
-            "globalThis.__bskyVisibleMeasured(JSON.stringify(globalThis.__bskyVisibleMeasurement))",
-            deadline,
-        )?;
+        if !reply.rows.is_empty() {
+            reply.validate_for(&request).map_err(str::to_string)?;
+            let encoded = reply.to_bounded_json().map_err(str::to_string)?;
+            self.guest
+                .set_global_json("__bskyVisibleMeasurement", &encoded, deadline)?;
+            self.guest.eval_global_with_deadline(
+                "globalThis.__bskyVisibleMeasured(JSON.stringify(globalThis.__bskyVisibleMeasurement))",
+                deadline,
+            )?;
+        }
         if std::time::Instant::now() >= deadline {
             self.authorized_stamp = None;
             self.framebuffer_texture = None;
@@ -453,37 +589,135 @@ impl PocketShell {
         }
         let placement: PlacementMessage =
             serde_json::from_str(&placed).map_err(|_| "invalid visible placement")?;
-        placement.validate_for(&request).map_err(str::to_string)?;
-        let mut commands = Vec::new();
-        for ((position, metrics), lines) in
-            placement.rows.iter().zip(&reply.rows).zip(&lines_by_row)
+        let current = self
+            .guest
+            .eval_global_with_deadline("globalThis.__bskyVisibleLayoutRequest || ''", deadline)?;
+        let viewport: MeasureRequest = serde_json::from_str(&current)
+            .map_err(|_| "invalid current viewport placement contract")?;
+        viewport.validate().map_err(str::to_string)?;
+        if viewport.stamp != request.stamp
+            || viewport.rows.len() > bsky_pocket::visible_text::MAX_LAYOUT_ROWS
         {
-            for (line, text) in lines.iter().take(metrics.line_count as usize).enumerate() {
+            return Ok(());
+        }
+        let known = self
+            .guest
+            .eval_global_with_deadline("globalThis.__bskyVisibleMetrics || '[]'", deadline)?;
+        let known: Vec<MeasureResult> =
+            serde_json::from_str(&known).map_err(|_| "invalid cached placement metrics")?;
+        let measured_viewport = bsky_pocket::visible_text::MeasureRequest {
+            schema: viewport.schema,
+            stamp: viewport.stamp.clone(),
+            rows: viewport
+                .rows
+                .iter()
+                .filter(|row| known.iter().any(|metric| metric.uri == row.uri))
+                .cloned()
+                .collect(),
+        };
+        if measured_viewport.rows.is_empty() {
+            return Ok(());
+        }
+        placement
+            .validate_for(&measured_viewport, &known)
+            .map_err(str::to_string)?;
+        let mut commands = Vec::new();
+        for position in &placement.rows {
+            let Some(metrics) = known.iter().find(|metric| metric.uri == position.uri) else {
+                continue;
+            };
+            let lines = request
+                .rows
+                .iter()
+                .position(|row| row.uri == position.uri)
+                .and_then(|index| lines_by_row.get(index).cloned())
+                .or_else(|| {
+                    self.measured_lines
+                        .get(&position.uri)
+                        .map(|entry| entry.0.clone())
+                });
+            let Some(lines) = lines else {
+                continue;
+            };
+            let body_top = i64::from(position.y);
+            let body_bottom = body_top + i64::from(metrics.body_height);
+            if body_bottom <= bsky_pocket::visible_text::VIEWPORT_TOP
+                || body_top >= bsky_pocket::visible_text::VIEWPORT_BOTTOM
+            {
+                continue;
+            }
+            let line_height = i64::from(metrics.line_height.max(1));
+            let first_line = ((bsky_pocket::visible_text::VIEWPORT_TOP - body_top)
+                .div_euclid(line_height))
+            .max(0) as usize;
+            let last_line = ((bsky_pocket::visible_text::VIEWPORT_BOTTOM - 1 - body_top)
+                .div_euclid(line_height))
+            .max(0) as usize;
+            for (line, text) in lines.iter().enumerate().take(metrics.line_count as usize) {
+                if line < first_line || line > last_line {
+                    continue;
+                }
                 if std::time::Instant::now() >= deadline {
                     return Ok(());
                 }
-                let y = position.y + metrics.baseline_offset + line as u16 * metrics.line_height;
-                if y >= 272 {
+                let y = body_top
+                    .saturating_add(i64::from(metrics.baseline_offset))
+                    .saturating_add((line as i64).saturating_mul(line_height));
+                if !(0..272).contains(&y) {
                     continue;
                 }
                 commands.push(NativeCommand::Text {
                     x: position.x as f32,
                     y: y as f32,
-                    scale: 0.75,
+                    scale: 1.5,
                     color: 0xffffffff,
-                    text: text.clone(),
+                    text: text.to_owned(),
                     stamp: Some(request.stamp.clone()),
-                    line: line as u8,
+                    line: line as u32,
+                    line_height: metrics.line_height,
                 });
             }
         }
-        if self.native_batch.commands.len() + commands.len() <= bsky_pocket::MAX_NATIVE_COMMANDS {
-            self.authorized_stamp = Some(request.stamp.clone());
-            self.native_batch
-                .commands
-                .retain(|c| !matches!(c, NativeCommand::Text { stamp: Some(_), .. }));
-            self.native_batch.commands.extend(commands);
-        }
+        let base_commands: Vec<_> = self
+            .native_batch
+            .commands
+            .iter()
+            .filter(|command| {
+                matches!(
+                    command,
+                    NativeCommand::Text { stamp: None, .. } | NativeCommand::Image { .. }
+                )
+            })
+            .cloned()
+            .collect();
+        let lines: Vec<_> = commands
+            .into_iter()
+            .filter_map(|command| match command {
+                NativeCommand::Text {
+                    x,
+                    y,
+                    scale,
+                    color,
+                    text,
+                    stamp,
+                    line,
+                    line_height,
+                } => Some((x, y, scale, color, text, stamp, line, line_height)),
+                NativeCommand::Image { .. } => None,
+            })
+            .collect();
+        let line_height = 18.0;
+        let packed = pack_lines(
+            &base_commands,
+            &lines,
+            self.native_batch.image.clone(),
+            line_height,
+        )?;
+        let mut final_batch = self.native_batch.clone();
+        final_batch.commands = packed;
+        final_batch.validate(480, 272)?;
+        self.authorized_stamp = Some(request.stamp.clone());
+        self.native_batch.commands = final_batch.commands;
         Ok(())
     }
     pub fn tick(&mut self, pad: &PadFrame, font: &Font) -> Result<(), String> {
@@ -496,38 +730,43 @@ impl PocketShell {
         if let Some(texture) = self.framebuffer_texture.as_ref() {
             frame.draw_pocket_framebuffer(texture);
         }
-        for command in &self.native_batch.commands {
-            match command {
-                NativeCommand::Text {
-                    stamp: Some(stamp), ..
-                } if self.authorized_stamp.as_ref() != Some(stamp) => continue,
-                NativeCommand::Text {
-                    x,
-                    y,
-                    scale,
-                    color,
-                    text,
-                    ..
-                } => frame.draw_pocket_text(
-                    font,
-                    (*x * 2.0) as i32,
-                    (*y * 2.0) as i32,
-                    bsky_render::Color(*color),
-                    *scale * 2.0,
-                    text,
-                ),
-                NativeCommand::Image { generation, x, y }
-                    if *generation == self.texture_generation =>
-                {
-                    if let Some(texture) = self.image_texture.as_ref() {
-                        frame.draw_texture(texture, *x * 2.0, *y * 2.0);
+        frame.with_clip_rectangle((0, 80, 960, 448), |frame| {
+            for command in &self.native_batch.commands {
+                match command {
+                    NativeCommand::Text {
+                        stamp: Some(stamp), ..
+                    } if self.authorized_stamp.as_ref() != Some(stamp) => continue,
+                    NativeCommand::Text {
+                        x,
+                        y,
+                        scale,
+                        color,
+                        text,
+                        line_height,
+                        ..
+                    } => frame.draw_pocket_text(
+                        font,
+                        (*x * 2.0) as i32,
+                        (*y * 2.0) as i32,
+                        bsky_render::Color(*color),
+                        *scale,
+                        text,
+                        i32::from(*line_height) * 2,
+                    ),
+                    NativeCommand::Image { generation, x, y }
+                        if *generation == self.texture_generation =>
+                    {
+                        if let Some(texture) = self.image_texture.as_ref() {
+                            frame.draw_texture(texture, *x * 2.0, *y * 2.0);
+                        }
                     }
+                    NativeCommand::Image { .. } => {}
                 }
-                NativeCommand::Image { .. } => {}
             }
-        }
+        });
     }
 }
+
 fn synthetic_rgba(generation: u32) -> Vec<u8> {
     let mut pixels = vec![0; 64 * 64 * 4];
     for (index, pixel) in pixels.chunks_exact_mut(4).enumerate() {

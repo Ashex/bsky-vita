@@ -69,6 +69,16 @@ unsafe extern "C" {
     pub fn vita2d_set_clear_color(color: c_uint);
     pub fn vita2d_get_clear_color() -> c_uint;
     pub fn vita2d_set_vblank_wait(enable: c_int);
+    pub fn vita2d_enable_clipping();
+    pub fn vita2d_disable_clipping();
+    pub fn vita2d_get_clipping_enabled() -> c_int;
+    pub fn vita2d_set_clip_rectangle(x_min: c_int, y_min: c_int, x_max: c_int, y_max: c_int);
+    pub fn vita2d_get_clip_rectangle(
+        x_min: *mut c_int,
+        y_min: *mut c_int,
+        x_max: *mut c_int,
+        y_max: *mut c_int,
+    );
 
     // Common dialog (IME) integration — wraps sceCommonDialogUpdate with
     // the current vita2d framebuffer info. Must be called between

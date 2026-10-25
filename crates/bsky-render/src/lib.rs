@@ -440,7 +440,7 @@ fn qr_to_rgba(s: &str, module_px: u32) -> Result<(Vec<u8>, u32), RenderError> {
                     rgba[off] = 0; // R
                     rgba[off + 1] = 0; // G
                     rgba[off + 2] = 0; // B
-                                       // alpha stays at 255
+                    // alpha stays at 255
                 }
             }
         }
@@ -1486,6 +1486,14 @@ impl<'r> Frame<'r> {
         scale: f32,
         text: &str,
     ) -> i32 {
+        if text.contains('\n') {
+            let line_height = (measure_native_text(font, scale, "Ag").1 / 2).max(1) * 2;
+            let mut last = x;
+            for (index, line) in text.split('\n').enumerate() {
+                last = self.draw_text(font, x, y + index as i32 * line_height, color, scale, line);
+            }
+            return last;
+        }
         #[cfg(target_os = "vita")]
         {
             let cstr = match CString::new(text.replace('\0', "")) {
@@ -1680,12 +1688,56 @@ impl<'r> Frame<'r> {
         color: Color,
         scale: f32,
         text: &str,
+        line_height: i32,
     ) {
-        self.draw_text(font, x, y, color, scale, text);
+        for (index, line) in text.split('\n').enumerate() {
+            let Some(line_y) = i32::try_from(index)
+                .ok()
+                .and_then(|index| index.checked_mul(line_height))
+                .and_then(|offset| y.checked_add(offset))
+            else {
+                break;
+            };
+            self.draw_text(font, x, line_y, color, scale, line);
+        }
     }
 
     pub fn draw_pocket_framebuffer(&mut self, tex: &Texture) {
         self.draw_texture_scale(tex, 0.0, 0.0, 1.0, 1.0);
+    }
+
+    pub fn with_clip_rectangle<R>(
+        &mut self,
+        rectangle: (i32, i32, i32, i32),
+        draw: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        #[cfg(target_os = "vita")]
+        let previous = unsafe {
+            let enabled = ffi::vita2d_get_clipping_enabled() != 0;
+            let (mut x0, mut y0, mut x1, mut y1) = (0, 0, 0, 0);
+            ffi::vita2d_get_clip_rectangle(&mut x0, &mut y0, &mut x1, &mut y1);
+            (enabled, (x0, y0, x1, y1))
+        };
+        #[cfg(target_os = "vita")]
+        unsafe {
+            let (x, y, width, height) = rectangle;
+            ffi::vita2d_set_clip_rectangle(x, y, x + width, y + height);
+            ffi::vita2d_enable_clipping();
+        }
+        let result = draw(self);
+        #[cfg(target_os = "vita")]
+        unsafe {
+            let (enabled, (x0, y0, x1, y1)) = previous;
+            ffi::vita2d_set_clip_rectangle(x0, y0, x1, y1);
+            if enabled {
+                ffi::vita2d_enable_clipping();
+            } else {
+                ffi::vita2d_disable_clipping();
+            }
+        }
+        #[cfg(not(target_os = "vita"))]
+        let _ = rectangle;
+        result
     }
 
     /// Draw `tex` scaled by `(x_scale, y_scale)` with top-left at `(x, y).

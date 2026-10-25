@@ -8,6 +8,8 @@ pub use bsky_feed::{
     ModerationPolicy, PostDto,
 };
 mod quickjs;
+pub mod scrolling;
+pub mod text_batch;
 pub mod visible_text;
 pub use pocket_runtime_cabi;
 use pocketjs_core::{DrawList, Ui};
@@ -31,7 +33,8 @@ pub enum NativeCommand {
         color: u32,
         text: String,
         stamp: Option<visible_text::Stamp>,
-        line: u8,
+        line: u32,
+        line_height: u16,
     },
     Image {
         generation: u32,
@@ -53,6 +56,15 @@ pub struct NativeImage {
 pub struct NativeBatch {
     pub commands: Vec<NativeCommand>,
     pub image: Option<NativeImage>,
+}
+
+impl NativeCommand {
+    pub fn encoded_size(&self) -> usize {
+        match self {
+            NativeCommand::Text { text, .. } => 64 + text.len(),
+            NativeCommand::Image { .. } => 64,
+        }
+    }
 }
 
 impl NativeBatch {
@@ -99,7 +111,7 @@ impl NativeBatch {
                         return Err("invalid native text command".into());
                     }
                     bytes = bytes
-                        .checked_add(16 + text.len())
+                        .checked_add(48 + text.len())
                         .ok_or("native batch size overflow")?;
                 }
                 NativeCommand::Image { generation, x, y } => {
@@ -162,8 +174,8 @@ fn configured_budget_value(value: Option<&str>, default: Duration) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::{
-        configured_budget_value, NativeBatch, NativeCommand, NativeImage, MAX_NATIVE_COMMANDS,
-        MAX_NATIVE_COMMAND_BYTES, MAX_NATIVE_TEXT_BYTES,
+        MAX_NATIVE_COMMAND_BYTES, MAX_NATIVE_COMMANDS, MAX_NATIVE_TEXT_BYTES, NativeBatch,
+        NativeCommand, NativeImage, configured_budget_value,
     };
     use std::time::Duration;
 
@@ -178,6 +190,7 @@ mod tests {
                 text: "Probe 🛰".into(),
                 stamp: None,
                 line: 0,
+                line_height: 18,
             }],
             image: None,
         };
@@ -212,6 +225,7 @@ mod tests {
                 text: "x".repeat(MAX_NATIVE_TEXT_BYTES + 1),
                 stamp: None,
                 line: 0,
+                line_height: 18,
             }],
             image: None,
         };
@@ -226,6 +240,7 @@ mod tests {
                     text: "bounded scale".into(),
                     stamp: None,
                     line: 0,
+                    line_height: 18,
                 }],
                 image: None,
             };
@@ -249,6 +264,7 @@ mod tests {
                 text: "x".into(),
                 stamp: None,
                 line: 0,
+                line_height: 18,
             }],
             image: None,
         };
@@ -263,6 +279,7 @@ mod tests {
                     text: String::new(),
                     stamp: None,
                     line: 0,
+                    line_height: 18,
                 })
                 .collect(),
             image: None,

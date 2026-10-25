@@ -55,10 +55,12 @@ export type CardLayout = {
   body_y: number;
   body_height: number;
   context_height: number;
+  card_height: number;
+  index: number;
 };
 export function layoutRows(rows: Metrics[]): CardLayout[] {
   let y = ROW_LAYOUT.top;
-  return rows.map((row) => {
+  return rows.map((row, index) => {
     const width = Math.min(
       row.width + ROW_LAYOUT.horizontalPadding * 2,
       ROW_LAYOUT.viewportWidth - ROW_LAYOUT.left - ROW_LAYOUT.right,
@@ -95,6 +97,8 @@ export function layoutRows(rows: Metrics[]): CardLayout[] {
         contextGap,
       body_height: bodyHeight,
       context_height: contextHeight,
+      card_height: height,
+      index,
     };
     y += height + ROW_LAYOUT.rowGap;
     return placement;
@@ -138,7 +142,6 @@ export function parseMeasureRequest(raw: string): MeasureRequest | null {
       v.schema !== 1 ||
       !stampOk(v.stamp) ||
       !Array.isArray(v.rows) ||
-      v.rows.length < 1 ||
       v.rows.length > 3
     )
       return null;
@@ -169,8 +172,12 @@ export function validateReply(
 ): boolean {
   return (
     reply.schema === 1 &&
-    JSON.stringify(reply.stamp) === JSON.stringify(request.stamp) &&
-    reply.rows.length === request.rows.length &&
+    reply.stamp.auth_generation === request.stamp.auth_generation &&
+    reply.stamp.mount_generation === request.stamp.mount_generation &&
+    reply.stamp.history_revision === request.stamp.history_revision &&
+    reply.stamp.layout_id === request.stamp.layout_id &&
+    reply.rows.length >= 1 &&
+    reply.rows.length <= request.rows.length &&
     reply.rows.every((r, i) => {
       const c = request.rows[i];
       return (
@@ -180,7 +187,7 @@ export function validateReply(
         (r.status === "ready" || r.status === "placeholder") &&
         Number.isInteger(r.line_count) &&
         r.line_count >= 0 &&
-        r.line_count <= 2 &&
+        r.line_count <= 65536 &&
         [r.line_height, r.baseline_offset, r.body_height].every(
           (n) => Number.isSafeInteger(n) && n >= 0,
         ) &&
@@ -192,31 +199,86 @@ export function validateReply(
 export function validatePlacement(
   p: PlacementMessage,
   request: MeasureRequest,
+  known: Metrics[] = [],
 ): boolean {
+  const indices = p.rows.map((row) => request.rows.findIndex((candidate) => candidate.uri === row.uri));
   return (
     p.schema === 1 &&
     JSON.stringify(p.stamp) === JSON.stringify(request.stamp) &&
-    p.rows.length === request.rows.length &&
-    p.rows.every(
-      (r, i) =>
-        r.uri === request.rows[i]?.uri &&
-        [r.x, r.y, r.body_height].every(Number.isInteger) &&
-        r.x >= 0 &&
-        r.y >= 0 &&
-        r.body_height > 0 &&
-        r.body_height <= 512,
-    )
+    p.rows.length > 0 && p.rows.length === request.rows.length && p.rows.length <= 200 &&
+    p.rows.every((r, i) => {
+      const metric = known.find((entry) => entry.uri === r.uri);
+      return indices[i]! >= 0 && (i === 0 || indices[i]! > indices[i - 1]!) &&
+        !!metric && metric.body_height === r.body_height &&
+        [r.x, r.y, r.body_height].every(Number.isSafeInteger) &&
+        r.x >= 0 && r.x <= 440 && r.body_height > 0 && r.body_height <= 1_000_000;
+    })
   );
 }
 export function visibleWindow<T extends { uri: string }>(
   history: T[],
   selected: string | null,
+  limit = 3,
 ): T[] {
-  if (!history.length) return [];
+  if (!history.length || limit <= 0) return [];
   const selectedIndex = history.findIndex((post) => post.uri === selected);
-  const index = Math.max(0, selectedIndex);
-  const start = Math.min(index, Math.max(0, history.length - 3));
-  return history.slice(start, start + 3);
+  const start = Math.max(0, selectedIndex);
+  return history.slice(start, Math.min(history.length, start + limit));
+}
+export type HeightEntry = { uri: string; height: number };
+export type TimelineScrollState = { offset: number; selected: string | null };
+export function reduceTimelineScroll(
+  history: { uri: string }[], heights: ReadonlyMap<string, number>,
+  state: TimelineScrollState, delta: -1 | 1, viewportHeight = ROW_LAYOUT.viewportHeight - ROW_LAYOUT.top - ROW_LAYOUT.bottom,
+): TimelineScrollState {
+  if (!history.length) return { offset: 0, selected: null };
+  const window = scrollWindow(history, heights, state.offset + delta * 24, viewportHeight);
+  const selected = moveSelection(history, state.selected, delta);
+  return { offset: window.offset, selected };
+}
+export type ScrollWindow = { rows: HeightEntry[]; offset: number; totalHeight: number };
+export function fullCardHeight(uri: string, heights: ReadonlyMap<string, number>): number {
+  return Math.max(1, Math.min(1_000_000, heights.get(uri) ?? ROW_LAYOUT.verticalPadding * 2 + ROW_LAYOUT.headerHeight + ROW_LAYOUT.headerGap + ROW_LAYOUT.countGap + ROW_LAYOUT.countHeight + 18));
+}
+export function scrollWindow(
+  history: { uri: string }[],
+  heights: ReadonlyMap<string, number>,
+  offset: number,
+  viewportHeight: number,
+  overscan = 64,
+): ScrollWindow {
+  const rowHeight = (uri: string) => fullCardHeight(uri, heights);
+  const totalHeight = history.reduce((sum, row) => sum + rowHeight(row.uri) + ROW_LAYOUT.rowGap, 0);
+  const maxOffset = Math.max(0, totalHeight - viewportHeight);
+  const clamped = Math.max(0, Math.min(maxOffset, Number.isFinite(offset) ? offset : 0));
+  const begin = Math.max(0, clamped - overscan);
+  const end = clamped + viewportHeight + overscan;
+  let y = 0;
+  const rows: HeightEntry[] = [];
+  for (const row of history) {
+    const height = rowHeight(row.uri);
+    if (y + height >= begin && y <= end) rows.push({ uri: row.uri, height });
+    y += height + ROW_LAYOUT.rowGap;
+    if (y > end) break;
+  }
+  return { rows, offset: clamped, totalHeight };
+}
+export function preserveAnchorOffset(
+  history: { uri: string }[],
+  before: ReadonlyMap<string, number>,
+  after: ReadonlyMap<string, number>,
+  anchorUri: string | null,
+  offset: number,
+): number {
+  if (!anchorUri) return offset;
+  const index = history.findIndex((row) => row.uri === anchorUri);
+  if (index < 0) return offset;
+  let delta = 0;
+  for (let i = 0; i < index; i++) {
+    const uri = history[i]!.uri;
+    delta += fullCardHeight(uri, after) - fullCardHeight(uri, before);
+  }
+  return Math.max(0, offset + delta);
 }
 export function moveSelection(
   history: { uri: string }[],

@@ -2,10 +2,14 @@ import { describe, expect, it } from "bun:test";
 import {
   firstCandidates,
   layoutRows,
+  scrollWindow,
+  preserveAnchorOffset,
   moveSelection,
+  reduceTimelineScroll,
   reconcileSelection,
   visibleWindow,
   parseMeasureRequest,
+  ROW_LAYOUT,
   validatePlacement,
   validateReply,
   utf8Bytes,
@@ -52,6 +56,32 @@ describe("visible text contract", () => {
       ),
     ).toBe(false);
   });
+  it("accepts partial measurement replies and validates full cached viewport placement", () => {
+    const reply = { schema: 1 as const, stamp: request.stamp, rows: [{ uri: "at://one", status: "ready" as const, width: 128, line_count: 1, line_height: 12, baseline_offset: 9, body_height: 12, continuation: false }] };
+    expect(validateReply(reply, request)).toBe(true);
+    const known: Metrics[] = [
+      { ...reply.rows[0]!, context: null },
+      { ...reply.rows[0]!, uri: "at://two", body_height: 24, line_count: 2 },
+    ];
+    const placement = { schema: 1 as const, stamp: request.stamp, rows: [
+      { uri: "at://one", x: 20, y: 40, body_height: 12 },
+      { uri: "at://two", x: 20, y: 80, body_height: 24 },
+    ] };
+    const viewport = { ...request, rows: [...request.rows, { uri: "at://three", width: 128 }, { uri: "at://four", width: 128 }] };
+    const fullPlacement = { ...placement, rows: [...placement.rows, { uri: "at://three", x: 20, y: 120, body_height: 12 }, { uri: "at://four", x: 20, y: 160, body_height: 12 }] };
+    const fullKnown = [...known, { ...known[0]!, uri: "at://three" }, { ...known[0]!, uri: "at://four" }];
+    expect(validatePlacement(fullPlacement, viewport, fullKnown)).toBe(true);
+    // Simulate the host completing only the first three of a four-row viewport;
+    // the fourth metric is cached and the full-layout contract remains valid.
+    const partialRequest = { ...viewport, rows: viewport.rows.slice(0, 3) };
+    expect(validateReply({ ...reply, rows: [reply.rows[0]!, { ...reply.rows[0]!, uri: "at://two" }, { ...reply.rows[0]!, uri: "at://three" }] }, partialRequest)).toBe(true);
+    const emptyReply = { ...reply, rows: [] };
+    expect(validateReply(emptyReply, partialRequest)).toBe(false);
+    expect(validatePlacement(fullPlacement, viewport, fullKnown)).toBe(true);
+    expect(validatePlacement(fullPlacement, viewport, fullKnown)).toBe(true);
+    expect(validatePlacement({ ...fullPlacement, rows: fullPlacement.rows.slice(0, 2) }, viewport, fullKnown)).toBe(false);
+    expect(validatePlacement({ ...placement, rows: [{ ...placement.rows[1]!, body_height: 12 }] }, request, known)).toBe(false);
+  });
   it("selects the first three history entries without filtering hidden entries", () => {
     const h = [
       { uri: "hidden" },
@@ -80,6 +110,69 @@ describe("visible text contract", () => {
     expect(moveSelection(original, "u239", 1)).toBe("u239");
     expect(firstCandidates(original).map((post) => post.uri)).toEqual(["u0", "u1", "u2"]);
     expect(visibleWindow(original, "u199").map((post) => post.uri)).toEqual(["u199", "u200", "u201"]);
+  });
+  it("windows pixel geometry with bounded mounted rows and preserves anchors across measurement", () => {
+    const history = Array.from({ length: 200 }, (_, i) => ({ uri: `u${i}` }));
+    const heights = new Map(history.map((row) => [row.uri, 60]));
+    heights.set("u2", 900);
+    const first = scrollWindow(history, heights, 0, 208, 64);
+    expect(first.rows.length).toBeLessThan(8);
+    const deep = scrollWindow(history, heights, 700, 208, 64);
+    expect(deep.rows.some((row) => row.uri === "u2")).toBe(true);
+    const before = new Map(heights);
+    heights.set("u0", 120);
+    const preserved = preserveAnchorOffset(history, before, heights, "u2", 100);
+    expect(preserved).toBe(160);
+    expect(scrollWindow(history, heights, Number.MAX_SAFE_INTEGER, 208).offset).toBeLessThan(
+      scrollWindow(history, heights, Number.MAX_SAFE_INTEGER, 208).totalHeight,
+    );
+    expect(scrollWindow(history, heights, Number.POSITIVE_INFINITY, 208).offset).toBe(0);
+  });
+  it("drives pixel scrolling and selection together, including a tall row's final viewport", () => {
+    const history = Array.from({ length: 200 }, (_, i) => ({ uri: `u${i}` }));
+    const heights = new Map(history.map((row) => [row.uri, 60]));
+    heights.set("u0", 1200);
+    let state = { offset: 0, selected: "u0" as string | null };
+    for (let i = 0; i < 64; i++) state = reduceTimelineScroll(history, heights, state, 1);
+    const lastLineY = 40 + 1200 - 64 - state.offset;
+    expect(lastLineY).toBeLessThan(264);
+    expect(state.offset).toBeGreaterThan(0);
+    expect(scrollWindow(history, heights, state.offset, 208, 64).rows.length).toBeLessThan(8);
+    const before = new Map(heights);
+    heights.set("u0", 1300);
+    state = { ...state, offset: preserveAnchorOffset(history, before, heights, "u1", state.offset) };
+    const appended = [...history, { uri: "u200" }];
+    expect(scrollWindow(appended, heights, state.offset, 208).offset).toBe(state.offset);
+    const evicted = appended.slice(1);
+    const selected = reconcileSelection(appended, evicted, state.selected);
+    expect(selected).toBe("u64");
+    expect(scrollWindow(evicted, heights, state.offset, 208).rows.length).toBeLessThan(8);
+  });
+  it("publishes placement independently when scrolling requires no new measurements", () => {
+    const history = Array.from({ length: 12 }, (_, i) => ({ uri: `u${i}` }));
+    const heights = new Map(history.map((row) => [row.uri, 60]));
+    const measured = new Set(history.map((row) => row.uri));
+    const visible = scrollWindow(history, heights, 120, 208, 64).rows;
+    const layoutRequest = { schema: 1, stamp: { auth_generation: 1, mount_generation: 1, history_revision: 1, layout_id: 1 }, rows: visible.map((row) => ({ uri: row.uri, width: 440 })) };
+    const measurementWork = visible.filter((row) => !measured.has(row.uri)).slice(0, 3);
+    expect(measurementWork).toHaveLength(0);
+    expect(layoutRequest.rows.length).toBeGreaterThan(0);
+    const placement = layoutRows(history.map((row) => ({
+      uri: row.uri, status: "ready" as const, width: 440, line_count: 2,
+      line_height: 18, baseline_offset: 14, body_height: 36, continuation: false,
+    })));
+    const positioned = placement.filter((row) => visible.some((entry) => entry.uri === row.uri));
+    expect(positioned.map((row) => row.uri)).toEqual(visible.map((row) => row.uri));
+  });
+  it("keeps pending viewport neighbors in ordered bounded measurement work", () => {
+    const visible = ["u4", "u5", "u6", "u7"].map((uri) => ({ uri }));
+    const measured = new Set(["u4", "u6"]);
+    const work = visible.filter((row) => !measured.has(row.uri)).slice(0, 3);
+    expect(work.map((row) => row.uri)).toEqual(["u5", "u7"]);
+  });
+  it("keeps the scrolling viewport below the fixed header", () => {
+    expect(ROW_LAYOUT.top).toBe(40);
+    expect(ROW_LAYOUT.viewportHeight - ROW_LAYOUT.top - ROW_LAYOUT.bottom).toBe(224);
   });
   it("counts UTF-8 by bytes for astral and combining text", () =>
     expect(utf8Bytes("🛰e\u0301\0")).toBe(8));
@@ -170,7 +263,7 @@ describe("visible text contract", () => {
       body_height: r.body_height,
     }));
     expect(
-      validatePlacement({ schema: 1, stamp: req.stamp, rows: packed }, req),
+      validatePlacement({ schema: 1, stamp: req.stamp, rows: packed }, req, metrics),
     ).toBe(true);
     expect(
       packed.every(

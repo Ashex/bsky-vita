@@ -14,7 +14,11 @@ import {
 import {
   firstCandidates,
   layoutRows,
+  scrollWindow,
+  preserveAnchorOffset,
+  ROW_LAYOUT,
   moveSelection,
+  reduceTimelineScroll,
   reconcileSelection,
   visibleWindow,
   parseMeasureRequest,
@@ -29,8 +33,54 @@ export function Timeline() {
   const [error, setError] = createSignal("");
   const [layout, setLayout] = createSignal<ReturnType<typeof layoutRows>>([]);
   const [selectedUri, setSelectedUri] = createSignal<string | null>(null);
+  const [scrollOffset, setScrollOffset] = createSignal(0);
+  const heights = new Map<string, number>();
+  const metricsByUri = new Map<string, import("./visible_text").Metrics>();
+  const measured = new Set<string>();
   let active: MeasureRequest | null = null;
   let currentStamp: Stamp | null = null;
+  const historyMetrics = (history: FeedDelivery["posts"]) => history.flatMap((post) => {
+    const cached = metricsByUri.get(post.uri);
+    return cached
+      ? [{ ...cached, context: post.state.state === "clean" ? (post.context ?? null) : null }]
+      : [];
+  });
+  const viewportLayout = (history: FeedDelivery["posts"]) => layoutRows(history.map((post) => {
+    const metric = metricsByUri.get(post.uri);
+    return metric
+      ? { ...metric, context: post.state.state === "clean" ? (post.context ?? null) : null }
+      : { uri: post.uri, status: "placeholder" as const, width: 440, line_count: 0, line_height: 0, baseline_offset: 0, body_height: 0, continuation: false, context: null };
+  }));
+  const publishViewport = (history: FeedDelivery["posts"], offset: number, stamp: Stamp) => {
+    const visible = scrollWindow(history, heights, offset, ROW_LAYOUT.viewportHeight - ROW_LAYOUT.top - ROW_LAYOUT.bottom, 64).rows;
+    const placementRequest = { schema: 1 as const, stamp, rows: visible.map((row) => ({ uri: row.uri, width: 440 })) };
+    globalThis.__bskyVisiblePlacementRequest = JSON.stringify(placementRequest);
+    const measuredRequest = {
+      ...placementRequest,
+      rows: placementRequest.rows.filter((row) => measured.has(row.uri)),
+    };
+    globalThis.__bskyVisibleLayoutRequest = JSON.stringify(measuredRequest);
+    const positioned = viewportLayout(history);
+    globalThis.__bskyVisiblePlacement = JSON.stringify({
+      schema: 1,
+      stamp,
+      rows: positioned
+        .filter((row) => visible.some((entry) => entry.uri === row.uri) && measured.has(row.uri))
+        .map((row) => ({
+          uri: row.uri,
+          x: row.body_x,
+          y: row.body_y - offset,
+          body_height: row.body_height,
+        })),
+    });
+    globalThis.__bskyVisibleMetrics = JSON.stringify(historyMetrics(history).map(({ uri, status, width, line_count, line_height, baseline_offset, body_height, continuation }) => ({
+      uri, status, width, line_count, line_height, baseline_offset, body_height, continuation,
+    })));
+    const missing = visible.filter((row) => !measured.has(row.uri)).slice(0, 3);
+    globalThis.__bskyVisibleWindow = missing.length
+      ? JSON.stringify({ schema: 1, stamp, rows: missing.map((row) => ({ uri: row.uri, width: 440 })) })
+      : "";
+  };
   globalThis.__bskyTakeFeedCommands = () => JSON.stringify(takeFeedCommands());
   globalThis.__bskySetFeedError = (m) => setError(m.slice(0, 160));
   requestFeed("first_page");
@@ -44,14 +94,20 @@ export function Timeline() {
     const previous = delivery()?.posts ?? [];
     const selection = reconcileSelection(previous, next.posts, selectedUri());
     setSelectedUri(selection);
+    const oldHeights = new Map(heights);
+    const nextUris = new Set(next.posts.map((post) => post.uri));
+    for (const uri of heights.keys()) if (!nextUris.has(uri)) { heights.delete(uri); metricsByUri.delete(uri); measured.delete(uri); }
+    const anchor = selectedUri();
+    const adjusted = preserveAnchorOffset(next.posts, oldHeights, heights, anchor, scrollOffset());
+    setScrollOffset(adjusted);
     setDelivery(next);
-    setLayout([]);
+    setLayout((old) => old.filter((row) => nextUris.has(row.uri)));
     currentStamp = null;
     globalThis.__bskyVisibleWindow = "";
     globalThis.nativeBatch.commands = [];
     if (selection) {
-      const rows = visibleWindow(next.posts, selection).map((post) => ({
-        uri: post.uri,
+      const rows = scrollWindow(next.posts, heights, adjusted, ROW_LAYOUT.viewportHeight - ROW_LAYOUT.top - ROW_LAYOUT.bottom, 64).rows.slice(0, 3).map((row) => ({
+        uri: row.uri,
         width: 440,
       }));
       const revision = Number(globalThis.__bskyHistoryRevision ?? 0);
@@ -71,15 +127,30 @@ export function Timeline() {
   };
   globalThis.__bskyVisibleCandidates = (raw) => {
     const req = parseMeasureRequest(raw);
-    if (!req) return "";
+    if (!req || req.rows.length === 0) return "";
     const history = delivery()?.posts ?? [];
+    if (req.rows.some((row) => !history.some((post) => post.uri === row.uri))) return "";
     const candidate = req.rows.map((row) =>
       history.find((post) => post.uri === row.uri),
     );
     if (candidate.some((p) => !p)) return "";
     currentStamp = req.stamp;
     active = req;
-    globalThis.__bskyVisiblePlacement = "";
+    // Keep the active measurement request separate from the native viewport
+    // request: cached rows may be placed even when they were not candidates.
+    const visible = geometry().rows;
+    globalThis.__bskyVisibleLayoutRequest = JSON.stringify({
+      schema: 1,
+      stamp: req.stamp,
+      rows: visible.map((row) => ({ uri: row.uri, width: 440 })),
+    });
+    const positioned = viewportLayout(history);
+    const cachedRows = positioned.filter((row) => visible.some((entry) => entry.uri === row.uri) && measured.has(row.uri));
+    globalThis.__bskyVisiblePlacement = JSON.stringify({
+      schema: 1,
+      stamp: req.stamp,
+      rows: cachedRows.map((row) => ({ uri: row.uri, x: row.body_x, y: row.body_y - scrollOffset(), body_height: row.body_height })),
+    });
     return JSON.stringify({
       schema: 1,
       stamp: req.stamp,
@@ -95,57 +166,67 @@ export function Timeline() {
     if (!active) return "";
     try {
       const reply = JSON.parse(raw) as MeasureReply;
-      const selection = JSON.parse(globalThis.__bskyVisibleWindow || "null") as { schema: number; stamp: Stamp; rows: { uri: string; width: number }[] } | null;
-      if (
-        !validateReply(reply, active) ||
-        (selection && selection.stamp.auth_generation === reply.stamp.auth_generation &&
-          selection.stamp.mount_generation === reply.stamp.mount_generation &&
-          selection.stamp.history_revision === reply.stamp.history_revision &&
-          selection.rows.some((row, index) => row.uri !== reply.rows[index]?.uri))
-      ) {
+      if (!validateReply(reply, active)) {
         active = null;
         return "";
       }
       const history = delivery()?.posts ?? [];
-      const rows = layoutRows(
-        reply.rows.map((row) => {
-          const post = history.find((entry) => entry.uri === row.uri);
-          return {
-            ...row,
-            context:
-              post?.state.state === "clean" ? (post.context ?? null) : null,
-          };
-        }),
-      );
-      const next = JSON.stringify({
+      const beforeHeights = new Map(heights);
+      for (const metric of reply.rows) { metricsByUri.set(metric.uri, metric); measured.add(metric.uri); }
+      const combined = viewportLayout(history);
+      for (const row of combined) heights.set(row.uri, row.height);
+      setScrollOffset(preserveAnchorOffset(history, beforeHeights, heights, selectedUri(), scrollOffset()));
+      const { offset, rows: visible } = geometry();
+      globalThis.__bskyVisibleLayoutRequest = JSON.stringify({
         schema: 1,
         stamp: reply.stamp,
-        rows: rows.map((r) => ({
-          uri: r.uri,
-          x: r.body_x,
-          y: r.body_y,
-          body_height: r.body_height,
-        })),
+        rows: visible.map((row) => ({ uri: row.uri, width: 440 })),
       });
-      globalThis.__bskyVisiblePlacement = next;
-      setLayout(rows);
+      const knownMetrics = historyMetrics(history);
+      const measuredVisible = visible.filter((row) => measured.has(row.uri));
+      globalThis.__bskyVisiblePlacementRequest = JSON.stringify({
+        schema: 1,
+        stamp: reply.stamp,
+        rows: visible.map((row) => ({ uri: row.uri, width: 440 })),
+      });
+      globalThis.__bskyVisibleLayoutRequest = globalThis.__bskyVisiblePlacementRequest;
+      globalThis.__bskyVisibleWindow = JSON.stringify({
+        schema: 1,
+        stamp: reply.stamp,
+        rows: visible.filter((row) => !measured.has(row.uri)).slice(0, 3).map((row) => ({ uri: row.uri, width: 440 })),
+      });
+      if (!visible.some((row) => !measured.has(row.uri))) {
+        globalThis.__bskyVisibleWindow = "";
+      }
+      globalThis.__bskyVisiblePlacement = JSON.stringify({
+        schema: 1,
+        stamp: reply.stamp,
+        rows: combined.filter((row) => measuredVisible.some((entry) => entry.uri === row.uri)).map((r) => ({ uri: r.uri, x: r.body_x, y: r.body_y - offset, body_height: r.body_height })),
+      });
+      globalThis.__bskyVisibleMetrics = JSON.stringify(knownMetrics.map(({ uri, status, width, line_count, line_height, baseline_offset, body_height, continuation }) => ({
+        uri, status, width, line_count, line_height, baseline_offset, body_height, continuation,
+      })));
+      setLayout(combined);
     } catch {
       globalThis.__bskyVisiblePlacement = "";
     }
     active = null;
     return "";
   };
-  const posts = () => visibleWindow(delivery()?.posts ?? [], selectedUri());
+  const geometry = () => scrollWindow(delivery()?.posts ?? [], heights, scrollOffset(), ROW_LAYOUT.viewportHeight - ROW_LAYOUT.top, 64);
+  const posts = () => {
+    const history = delivery()?.posts ?? [];
+    const set = new Set(geometry().rows.map((row) => row.uri));
+    return history.filter((post) => set.has(post.uri));
+  };
   const publishSelection = (delta: -1 | 1) => {
     const history = delivery()?.posts ?? [];
-    const selected = moveSelection(history, selectedUri(), delta);
+    const next = reduceTimelineScroll(history, heights, { offset: scrollOffset(), selected: selectedUri() }, delta);
+    const selected = next.selected;
     setSelectedUri(selected);
-    if (selected && currentStamp) {
-      const rows = visibleWindow(history, selected).map((post) => ({
-        uri: post.uri,
-        width: 440,
-      }));
-      globalThis.__bskyVisibleWindow = JSON.stringify({ schema: 1, stamp: currentStamp, rows });
+    setScrollOffset(next.offset);
+    if (currentStamp) {
+      publishViewport(history, next.offset, currentStamp);
     }
   };
   const selectPrevious = () => publishSelection(-1);
@@ -158,7 +239,7 @@ export function Timeline() {
         ? ""
         : "No posts yet");
   return (
-    <View class="relative w-full h-full overflow-hidden bg-slate-950">
+    <View class="relative w-full h-full bg-slate-950">
       <Text
         class="absolute text-lg text-white font-bold"
         style={{ insetL: 12, insetT: 8, height: 22 }}
@@ -173,14 +254,16 @@ export function Timeline() {
           {status()}
         </Text>
       )}
+      <View class="absolute overflow-hidden" style={{ insetL: 0, insetT: 40, width: 480, height: 224 }}>
       <For each={posts()}>
         {(post, index) => {
           const rect = () => layout().find((row) => row.uri === post.uri);
-          const top = () => rect()?.y ?? 40 + index() * 92;
+          const top = () => (rect()?.y ?? 40 + index() * 92) - geometry().offset - ROW_LAYOUT.top;
           const contextHeight = () => rect()?.context_height ?? 0;
-          const bodyY = () => rect()?.body_y ?? top() + 42;
+          const bodyY = () => (rect()?.body_y ?? top() + 42) - geometry().offset - ROW_LAYOUT.top;
           const cardHeight = () => rect()?.height ?? 84;
           const bodyHeight = () => rect()?.body_height ?? 18;
+          const pending = () => !metricsByUri.has(post.uri);
           const x = () => rect()?.x ?? 12;
           const width = () => rect()?.width ?? 456;
           return (
@@ -231,7 +314,10 @@ export function Timeline() {
                   }
                 </Text>
               )}
-              {post.state.state === "clean" && (
+              {post.state.state === "clean" && pending() && (
+                <Text class="absolute text-xs text-slate-400" style={{ insetL: x() + 8, insetT: bodyY(), width: width() - 16, height: 18 }}>Loading…</Text>
+              )}
+              {post.state.state === "clean" && !pending() && (
                 <Text
                   class="absolute text-xs text-slate-200"
                   style={{
@@ -259,6 +345,7 @@ export function Timeline() {
           );
         }}
       </For>
+      </View>
       <ActionHandler button={BTN.UP} onPress={selectPrevious} />
       <ActionHandler button={BTN.DOWN} onPress={selectNext} />
       <ActionHandler
@@ -290,4 +377,7 @@ declare global {
   var __bskyVisibleCandidates: (json: string) => string;
   var __bskyVisibleMeasured: (json: string) => string;
   var __bskyVisiblePlacement: string;
+  var __bskyVisibleMetrics: string;
+  var __bskyVisiblePlacementRequest: string;
+  var __bskyVisibleLayoutRequest: string;
 }
