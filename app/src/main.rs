@@ -165,6 +165,8 @@ fn main() {
     #[cfg(feature = "pocketjs-poc")]
     let mut pocket_shell: Option<pocket::PocketShell> = None;
     #[cfg(feature = "pocketjs-poc")]
+    let mut pocket_media = bsky_worker::media_registry::PocketMediaRegistry::new();
+    #[cfg(feature = "pocketjs-poc")]
     let pocket_coordinator =
         std::sync::Arc::new(std::sync::Mutex::new(bsky_feed::FeedCoordinator::default()));
 
@@ -346,6 +348,22 @@ fn main() {
                 };
                 #[cfg(feature = "pocketjs-poc")]
                 if let WorkResponse::FeedPageProjected { correlation, batch } = &resp {
+                    if correlation.auth_generation == auth_generation {
+                        if let Ok(projected) = batch {
+                            let scope = projected
+                                .native
+                                .descriptors
+                                .first()
+                                .map(|d| d.scope.clone())
+                                .unwrap_or_else(|| bsky_feed::AccountScope {
+                                    account_did: String::new(),
+                                    auth_generation: correlation.auth_generation,
+                                });
+                            if !pocket_media.install(scope, &projected.native.descriptors) {
+                                bsky_log::log!("PocketJS native media descriptor install rejected");
+                            }
+                        }
+                    }
                     let converted = bsky_feed::FeedCorrelation {
                         schema: correlation.schema,
                         auth_generation: correlation.auth_generation,
@@ -354,7 +372,10 @@ fn main() {
                         source: correlation.source.clone(),
                         cursor: correlation.cursor.clone(),
                     };
-                    let result = batch.as_ref().map(|projected| projected.delivery.clone()).map_err(Clone::clone);
+                    let result = batch
+                        .as_ref()
+                        .map(|projected| projected.delivery.clone())
+                        .map_err(Clone::clone);
                     let effects = pocket_coordinator.lock().unwrap().handle(
                         bsky_feed::FeedEvent::Completed {
                             correlation: converted,
@@ -376,10 +397,14 @@ fn main() {
             }
         }
 
+        #[cfg(feature = "pocketjs-poc")]
+        drop(pocket_media.drain());
+
         // An auth failure from this frame's session must win over an
         // AuthComplete action produced by the same presentation.
         #[cfg(feature = "pocketjs-poc")]
         if session_dead {
+            pocket_media.invalidate();
             auth_generation = auth_generation.wrapping_add(1).max(1);
             let effects = pocket_coordinator
                 .lock()
@@ -424,6 +449,7 @@ fn main() {
                 ScreenAction::AuthComplete { client, next } => {
                     #[cfg(feature = "pocketjs-poc")]
                     {
+                        pocket_media.invalidate();
                         auth_generation = auth_generation.wrapping_add(1).max(1);
                         let effects = pocket_coordinator
                             .lock()
@@ -440,6 +466,7 @@ fn main() {
                 ScreenAction::Logout => {
                     #[cfg(feature = "pocketjs-poc")]
                     {
+                        pocket_media.invalidate();
                         auth_generation = auth_generation.wrapping_add(1).max(1);
                         let effects = pocket_coordinator
                             .lock()

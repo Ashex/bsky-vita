@@ -197,6 +197,13 @@ impl MediaExecutor {
         self.accounting.generation.fetch_add(1, Ordering::SeqCst);
     }
 
+    /// Set the exact auth generation accepted by this executor.
+    pub fn set_generation(&self, generation: u64) {
+        self.accounting
+            .generation
+            .store(generation, Ordering::SeqCst);
+    }
+
     #[cfg(test)]
     fn generation(&self) -> u64 {
         self.accounting.generation.load(Ordering::SeqCst)

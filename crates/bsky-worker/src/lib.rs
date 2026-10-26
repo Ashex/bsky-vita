@@ -79,6 +79,7 @@ use futures::executor::block_on;
 use std::time::{Duration, Instant};
 mod feed_projection;
 pub mod media_executor;
+pub mod media_registry;
 use feed_projection::{project_page, project_page_with_native};
 
 /// Identifies which feed a `FetchFeed` request targets.
