@@ -264,6 +264,56 @@ impl VitaHttpClient {
         read_capped(resp.into_reader(), max_bytes, total, |_, _| {})
     }
 
+    /// GET `url` into memory, capped at `max_bytes`, with an absolute
+    /// deadline that covers DNS, connection, headers, and the body read.
+    /// Installs per-operation transport timeouts (`timeout_connect`,
+    /// `timeout_read`, `timeout_write`, overall `.timeout()`) derived from
+    /// the remaining time, and prevents implicit redirect-following so
+    /// every redirect also observes the deadline. The scoped-deadline
+    /// mechanism (see `with_absolute_request_deadline`) is occupied on the
+    /// calling thread for the duration of this call; any pre-existing scope
+    /// is restored on return. Returns a clear error when the deadline has
+    /// already expired before any I/O happens.
+    pub fn get_bytes_capped_with_deadline(
+        &self,
+        url: &str,
+        max_bytes: u64,
+        deadline: std::time::Instant,
+    ) -> Result<Vec<u8>, String> {
+        with_absolute_request_deadline(deadline, || {
+            let remaining = remaining_request_time()
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| "deadline already expired".to_string())?;
+
+            let scoped_agent = ureq::AgentBuilder::new()
+                .resolver(resolve_host)
+                .timeout_connect(remaining.min(MAX_CONNECT_SLICE))
+                .timeout_read(remaining)
+                .timeout_write(remaining)
+                .redirects(0)
+                .build();
+            let mut req = scoped_agent.get(url).timeout(remaining);
+
+            // Apply Host header for the resolver's benefit (same approach
+            // the scoped agent in send_http relies on).
+            if let Some(host) = url_host(url) {
+                req = req.set("Host", &host);
+            }
+
+            let resp = match req.call() {
+                Ok(r) => r,
+                Err(ureq::Error::Status(code, _)) => return Err(format!("HTTP {code}")),
+                Err(e) => return Err(format!("{e}")),
+            };
+
+            remaining_request_time()
+                .map_err(|e| e.to_string())?;
+
+            let total = content_length(&resp);
+            read_capped(resp.into_reader(), max_bytes, total, |_, _| {})
+        })
+    }
+
     /// Stream `url` to `dest`, capped at `max_bytes`, forwarding throttled
     /// progress via `on_progress(downloaded, total)`. The body is written
     /// straight to a `<dest>.part` sidecar in 64 KB chunks — it never sits
@@ -372,6 +422,17 @@ impl HttpClient for VitaHttpClient {
 fn content_length(resp: &ureq::Response) -> Option<u64> {
     resp.header("Content-Length")
         .and_then(|s| s.parse::<u64>().ok())
+}
+
+/// Extract the `Host` header value from a URL: `host:port` for non-default
+/// ports, `host` otherwise. Returns `None` if the URL has no authority.
+fn url_host(url: &str) -> Option<String> {
+    let authority = url
+        .split("://")
+        .nth(1)?
+        .split('/')
+        .next()?;
+    Some(authority.to_owned())
 }
 
 /// Read `reader` fully into a `Vec`, but never more than `max_bytes`.
@@ -927,5 +988,175 @@ mod tests {
             .unwrap();
         let fut = client.send_http(req);
         assert_send(fut);
+    }
+
+    // ── get_bytes_capped_with_deadline tests ──────────────────────────
+
+    #[test]
+    fn deadline_capped_get_expired_before_start_returns_error() {
+        let _guard = TEST_NETWORK_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Expired deadline → error before any I/O (no server needed).
+        let client = VitaHttpClient::new();
+        let past = Instant::now() - Duration::from_secs(10);
+        let result = client.get_bytes_capped_with_deadline(
+            "http://127.0.0.1:1/",
+            1024,
+            past,
+        );
+        assert!(result.is_err(), "expired deadline must be rejected");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("deadline") || err.contains("expired"),
+            "error must indicate deadline expiry: {err}"
+        );
+    }
+
+    #[test]
+    fn deadline_capped_get_respects_content_length_cap() {
+        let _guard = TEST_NETWORK_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 1024];
+            let _ = stream.read(&mut request);
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n").unwrap();
+            let body = vec![b'x'; 100];
+            stream.write_all(&body).unwrap();
+        });
+        let client = VitaHttpClient::new();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let result =
+            client.get_bytes_capped_with_deadline(&format!("http://{address}/"), 4, deadline);
+        assert!(result.is_err(), "Content-Length > cap must be rejected");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("Content-Length"),
+            "error must mention Content-Length: {err}"
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn deadline_capped_get_stream_over_cap_body() {
+        let _guard = TEST_NETWORK_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 1024];
+            let _ = stream.read(&mut request);
+            // No Content-Length → chunked or connection-close body.
+            stream.write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n").unwrap();
+            let body = vec![b'x'; 200];
+            stream.write_all(&body).unwrap();
+        });
+        let client = VitaHttpClient::new();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let result =
+            client.get_bytes_capped_with_deadline(&format!("http://{address}/"), 16, deadline);
+        assert!(result.is_err(), "streaming body > cap must be rejected");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("exceeded cap"),
+            "error must mention cap: {err}"
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn deadline_capped_get_restores_prior_scope_and_does_not_leak() {
+        let _guard = TEST_NETWORK_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(conn) => conn,
+                    Err(_) => break,
+                };
+                let mut request = [0; 1024];
+                let _ = stream.read(&mut request);
+                stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nbody").unwrap();
+            }
+        });
+        let client = VitaHttpClient::new();
+        // Outer scope: 5s deadline.
+        with_request_deadline(Duration::from_secs(5), || {
+            let outer_start = remaining_request_time().unwrap().unwrap();
+            // Inner call: uses its own 3s deadline.
+            let inner_deadline = Instant::now() + Duration::from_secs(3);
+            let result = client.get_bytes_capped_with_deadline(
+                &format!("http://{address}/"),
+                1024,
+                inner_deadline,
+            );
+            assert!(result.is_ok(), "inner call must succeed");
+            // After inner call returns, outer scope must still be active
+            // and must not have been shortened.
+            let after = remaining_request_time().unwrap().unwrap();
+            assert!(
+                after > Duration::from_secs(3),
+                "outer deadline must not be shortened by inner call"
+            );
+            assert!(
+                after <= outer_start,
+                "outer deadline must not grow"
+            );
+        });
+        // After outer scope exits, no deadline should remain.
+        assert!(
+            remaining_request_time().unwrap().is_none(),
+            "deadline must be cleared after outer scope"
+        );
+        // Now call unscoped get_bytes_capped to confirm the deadline
+        // from the inner call is not leaked — it should use the plain
+        // agent (no deadline) and succeed.
+        let result = client.get_bytes_capped(&format!("http://{address}/"), 1024);
+        assert!(result.is_ok(), "unscoped call after scoped must succeed");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn deadline_capped_get_body_read_timeout_reported_as_error() {
+        let _guard = TEST_NETWORK_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 1024];
+            let _ = stream.read(&mut request);
+            // Send headers, then stall. The transport timeout and/or
+            // the scoped deadline will fire before we send the body.
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5000\r\nConnection: close\r\n\r\n").unwrap();
+            // Stall: the client will time out during the body read.
+            std::thread::sleep(Duration::from_secs(2));
+            // The client has already given up by now.
+        });
+        let client = VitaHttpClient::new();
+        let deadline = Instant::now() + Duration::from_millis(200);
+        let result =
+            client.get_bytes_capped_with_deadline(&format!("http://{address}/"), 10_000, deadline);
+        assert!(result.is_err(), "body read must time out");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("ead") || err.contains("deadline") || err.contains("timeout") || err.contains("TimedOut"),
+            "error must indicate timeout: {err}"
+        );
+        server.join().unwrap();
     }
 }
