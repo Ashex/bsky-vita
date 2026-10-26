@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bsky_feed::{
     AccountScope, AssetIdentity, NativeAssetDescriptor, MAX_AGGREGATE_DESCRIPTOR_BYTES,
@@ -76,6 +76,33 @@ impl PocketMediaRegistry {
             &descriptor.identity,
         );
         Some(self.executor.submit(key, url, deadline, IMAGE_BYTE_QUOTA))
+    }
+
+    /// Look up the installed descriptor for a handle in the current scope.
+    pub fn descriptor(&self, handle: &str) -> Option<&NativeAssetDescriptor> {
+        let descriptor = self.descriptors.get(handle)?;
+        (descriptor.scope == self.scope.clone()?).then_some(descriptor)
+    }
+
+    /// Submit every installed handle from `handles` that is not already in
+    /// flight or cached, up to `limit` submissions. Returns the number of
+    /// jobs that were newly accepted.
+    pub fn submit_visible(
+        &self,
+        handles: impl IntoIterator<Item = String>,
+        deadline: Instant,
+        limit: usize,
+    ) -> usize {
+        let mut accepted = 0;
+        for handle in handles {
+            if accepted >= limit {
+                break;
+            }
+            if matches!(self.submit(&handle, deadline), Some(Admission::Accepted)) {
+                accepted += 1;
+            }
+        }
+        accepted
     }
 
     /// Drain completions belonging to the installed account and auth generation.
@@ -238,5 +265,43 @@ mod tests {
         assert!(r.install(a.clone(), &[descriptor(a, "h", "x")]));
         assert!(r.install(scope("did:plc:b", 2), &[]));
         assert!(r.submit("h", Instant::now()).is_none());
+    }
+
+    #[test]
+    fn descriptor_lookup_requires_current_scope() {
+        let mut r = registry();
+        let a = scope("did:plc:a", 1);
+        assert!(r.install(a, &[descriptor(scope("did:plc:a", 1), "h", "rev")]));
+        assert_eq!(
+            r.descriptor("h").map(|d| d.identity.clone()),
+            Some(AssetIdentity::Avatar {
+                author_did: "did:plc:author".into(),
+                source_revision: "rev".into(),
+            })
+        );
+        assert!(r.descriptor("missing").is_none());
+        r.invalidate();
+        assert!(r.descriptor("h").is_none());
+    }
+
+    #[test]
+    fn submit_visible_counts_only_accepted_within_limit() {
+        let mut r = registry();
+        let s = scope("did:plc:a", 1);
+        let descriptors: Vec<_> = (0..4)
+            .map(|i| descriptor(s.clone(), &format!("h{i}"), "rev"))
+            .collect();
+        assert!(r.install(s, &descriptors));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let accepted = r.submit_visible(
+            vec!["h0".into(), "missing".into(), "h1".into(), "h2".into()],
+            deadline,
+            2,
+        );
+        assert!(accepted <= 2, "limit bounds the number of new submissions");
+        let zero = r.submit_visible(vec!["h3".into()], deadline, 0);
+        assert_eq!(zero, 0);
+        let expired = r.submit_visible(vec!["h3".into()], Instant::now(), 4);
+        assert_eq!(expired, 0, "an expired deadline is never accepted");
     }
 }
