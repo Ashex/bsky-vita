@@ -17,7 +17,7 @@ use pocketjs_core::{DrawList, Ui};
 pub use quickjs::{Clock, EmbeddedGuest};
 use std::time::Duration;
 pub const GUEST_HEAP_LIMIT: usize = 16 * 1024 * 1024;
-pub const FRAME_BUDGET: Duration = Duration::from_millis(4);
+pub const FRAME_BUDGET: Duration = Duration::from_millis(16);
 pub const STARTUP_BUDGET: Duration = Duration::from_millis(2_000);
 pub const MAX_NATIVE_COMMANDS: usize = 8;
 pub const MAX_NATIVE_COMMAND_BYTES: usize = 4 * 1024;
