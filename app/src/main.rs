@@ -220,7 +220,7 @@ fn main() {
                     .abandon_mount(shell.mount_generation());
                 bsky_render::wait_rendering_done();
                 pocket_shell = None;
-            } else if let Err(e) = shell.prepare_until(&pf, &font, pocket_frame_deadline) {
+            } else if let Err(e) = shell.prepare_until(&pf, &tf, &font, pocket_frame_deadline) {
                 pocket_coordinator
                     .lock()
                     .unwrap()

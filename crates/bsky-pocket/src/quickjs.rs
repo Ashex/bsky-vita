@@ -684,6 +684,19 @@ impl EmbeddedGuest {
     pub fn set_buttons(&self, buttons: u32) {
         self.input.set_buttons(buttons);
     }
+    pub fn set_touch_snapshot(
+        &mut self,
+        snapshot: crate::TouchSnapshot,
+        deadline: Instant,
+    ) -> Result<(), String> {
+        let contacts: Vec<_> = snapshot
+            .as_slice()
+            .iter()
+            .map(|contact| serde_json::json!({"id":contact.id,"x":contact.x,"y":contact.y}))
+            .collect();
+        let json = serde_json::json!({"contacts":contacts}).to_string();
+        self.set_global_json("__bskyTouch", &json, deadline)
+    }
 
     pub fn collect(&mut self) -> Result<(), String> {
         if self.state != GuestState::Active {

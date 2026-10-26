@@ -227,6 +227,37 @@ export function visibleWindow<T extends { uri: string }>(
 }
 export type HeightEntry = { uri: string; height: number };
 export type TimelineScrollState = { offset: number; selected: string | null };
+export type TouchContact = { id: number; x: number; y: number };
+export type TouchRailState =
+  | { kind: "idle" }
+  | { kind: "blocked" }
+  | { kind: "captured"; id: number; lastY: number; dragging: boolean };
+export const TOUCH_RAIL = { left: 456, right: 480, top: 40, bottom: 264 } as const;
+const IDLE_TOUCH: TouchRailState = { kind: "idle" };
+const BLOCKED_TOUCH: TouchRailState = { kind: "blocked" };
+export function reduceTouchRail(
+  state: TouchRailState | null,
+  contacts: TouchContact[],
+): { state: TouchRailState; delta: number } {
+  const current = state ?? IDLE_TOUCH;
+  if (current.kind === "blocked") {
+    return contacts.length ? { state: BLOCKED_TOUCH, delta: 0 } : { state: IDLE_TOUCH, delta: 0 };
+  }
+  if (contacts.length > 1) return { state: BLOCKED_TOUCH, delta: 0 };
+  const contact = contacts[0];
+  if (current.kind === "captured") {
+    if (!contact || contact.id !== current.id) {
+      return { state: contacts.length ? BLOCKED_TOUCH : IDLE_TOUCH, delta: 0 };
+    }
+    const delta = current.lastY - contact.y;
+    return { state: { kind: "captured", id: current.id, lastY: contact.y, dragging: current.dragging || delta !== 0 }, delta };
+  }
+  if (!contact) return { state: IDLE_TOUCH, delta: 0 };
+  if (contact.x < TOUCH_RAIL.left || contact.x >= TOUCH_RAIL.right || contact.y < TOUCH_RAIL.top || contact.y >= TOUCH_RAIL.bottom) {
+    return { state: BLOCKED_TOUCH, delta: 0 };
+  }
+  return { state: { kind: "captured", id: contact.id, lastY: contact.y, dragging: false }, delta: 0 };
+}
 export function reduceTimelineScroll(
   history: { uri: string }[], heights: ReadonlyMap<string, number>,
   state: TimelineScrollState, delta: -1 | 1, viewportHeight = ROW_LAYOUT.viewportHeight - ROW_LAYOUT.top - ROW_LAYOUT.bottom,

@@ -254,6 +254,32 @@ mod tests {
         assert!(super::zeroed(usize::MAX).is_err())
     }
 }
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TouchContact {
+    pub id: u8,
+    pub x: u16,
+    pub y: u16,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TouchSnapshot {
+    pub contacts: [TouchContact; 6],
+    pub len: u8,
+}
+impl TouchSnapshot {
+    pub fn from_contacts(contacts: impl IntoIterator<Item = TouchContact>) -> Self {
+        let mut snapshot = Self::default();
+        for contact in contacts.into_iter().take(snapshot.contacts.len()) {
+            snapshot.contacts[snapshot.len as usize] = contact;
+            snapshot.len += 1;
+        }
+        snapshot
+    }
+    pub fn as_slice(&self) -> &[TouchContact] {
+        &self.contacts[..self.len as usize]
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct InputQueue(Rc<RefCell<InputFrameBuilder>>);
 impl InputQueue {
@@ -269,5 +295,22 @@ impl InputSource for InputQueue {
     }
     fn poll(&mut self, out: &mut InputFrameBuilder) {
         *out = std::mem::take(&mut *self.0.borrow_mut())
+    }
+}
+
+#[cfg(test)]
+mod touch_tests {
+    use super::{TouchContact, TouchSnapshot};
+
+    #[test]
+    fn touch_snapshot_is_fixed_capacity_and_preserves_contact_identity() {
+        let snapshot = TouchSnapshot::from_contacts((0..8).map(|id| TouchContact {
+            id,
+            x: id as u16,
+            y: 544,
+        }));
+        assert_eq!(snapshot.len, 6);
+        assert_eq!(snapshot.as_slice()[0].id, 0);
+        assert_eq!(snapshot.as_slice()[5].id, 5);
     }
 }

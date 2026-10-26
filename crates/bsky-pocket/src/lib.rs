@@ -11,6 +11,7 @@ mod quickjs;
 pub mod scrolling;
 pub mod text_batch;
 pub mod visible_text;
+pub use adapters::{TouchContact, TouchSnapshot};
 pub use pocket_runtime_cabi;
 use pocketjs_core::{DrawList, Ui};
 pub use quickjs::{Clock, EmbeddedGuest};

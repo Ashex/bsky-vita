@@ -6,6 +6,7 @@ import {
   preserveAnchorOffset,
   moveSelection,
   reduceTimelineScroll,
+  reduceTouchRail,
   reconcileSelection,
   visibleWindow,
   parseMeasureRequest,
@@ -17,6 +18,54 @@ import {
 } from "../src/visible_text";
 
 describe("visible text contract", () => {
+  it("captures only an initial single rail contact and blocks incomplete or multi-touch gestures", () => {
+    const contact = (id: number, x: number, y: number) => ({ id, x, y });
+    let result = reduceTouchRail(null, [contact(7, 456, 100)]);
+    expect(result.state).toEqual({ kind: "captured", id: 7, lastY: 100, dragging: false });
+    expect(result.delta).toBe(0);
+    result = reduceTouchRail(result.state, [contact(7, 400, 80)]);
+    expect(result.delta).toBe(20);
+    expect(result.state).toEqual({ kind: "captured", id: 7, lastY: 80, dragging: true });
+
+    result = reduceTouchRail({ kind: "idle" }, [contact(7, 400, 100)]);
+    expect(result.state.kind).toBe("blocked");
+    result = reduceTouchRail(result.state, [contact(7, 460, 80)]);
+    expect(result.state.kind).toBe("blocked");
+
+    result = reduceTouchRail(null, [contact(7, 460, 100), contact(8, 420, 110)]);
+    expect(result.state.kind).toBe("blocked");
+    result = reduceTouchRail(result.state, [contact(8, 420, 90)]);
+    expect(result.state.kind).toBe("blocked");
+    result = reduceTouchRail(result.state, []);
+    expect(result.state.kind).toBe("idle");
+
+    result = reduceTouchRail({ kind: "captured", id: 7, lastY: 100, dragging: true }, [contact(8, 460, 90)]);
+    expect(result.state.kind).toBe("blocked");
+    result = reduceTouchRail(result.state, []);
+    expect(result.state.kind).toBe("idle");
+
+    result = reduceTouchRail({ kind: "captured", id: 7, lastY: 100, dragging: true }, [contact(7, 400, 80), contact(8, 460, 80)]);
+    expect(result.state.kind).toBe("blocked");
+    expect(result.delta).toBe(0);
+    result = reduceTouchRail(result.state, [contact(7, 400, 60)]);
+    expect(result.state.kind).toBe("blocked");
+    expect(result.delta).toBe(0);
+    result = reduceTouchRail(result.state, []);
+    expect(result.state.kind).toBe("idle");
+
+    expect(reduceTouchRail(null, [contact(1, 455, 100)]).state.kind).toBe("blocked");
+    expect(reduceTouchRail(null, [contact(1, 479, 263)]).state.kind).toBe("captured");
+    expect(reduceTouchRail(null, [contact(1, 480, 263)]).state.kind).toBe("blocked");
+    expect(reduceTouchRail(null, [contact(1, 460, 264)]).state.kind).toBe("blocked");
+    expect(reduceTouchRail({ kind: "captured", id: 7, lastY: 50, dragging: true }, []).state.kind).toBe("idle");
+    result = reduceTouchRail({ kind: "captured", id: 7, lastY: 100, dragging: true }, [contact(7, 400, 80)]);
+    expect(result.delta).toBe(20);
+  });
+  it("converts native screen pixels to half-density guest coordinates with bounded contacts", () => {
+    const native = [{ id: 4, x: 912, y: 528 }];
+    const snapshot = native.map(({ id, x, y }) => ({ id, x: Math.min(960, Math.max(0, x)) / 2, y: Math.min(544, Math.max(0, y)) / 2 }));
+    expect(snapshot).toEqual([{ id: 4, x: 456, y: 264 }]);
+  });
   const request = {
     schema: 1 as const,
     stamp: {

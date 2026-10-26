@@ -8,6 +8,137 @@ fn post(uri: &str, text: &str, state: &str) -> serde_json::Value {
 }
 
 #[test]
+fn packaged_guest_touch_frame_scrolls_and_dpad_still_works_in_same_state() {
+    let mut guest = EmbeddedGuest::new(480, 272).expect("runtime initializes");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    guest.eval("globalThis.__bskyHistoryRevision=1").unwrap();
+    let posts: Vec<_> = (0..30)
+        .map(|i| post(&format!("at://touch-{i}"), "row", "clean"))
+        .collect();
+    let feed = serde_json::json!({"schema":1,"correlation":{"schema":1,"auth_generation":1,"mount_generation":1,"request_id":1,"source":"following","cursor":null},"posts":posts,"cursor":null});
+    guest
+        .deliver_feed_json_with_deadline(&feed.to_string(), deadline)
+        .unwrap();
+    let request = guest.eval_global("globalThis.__bskyVisibleWindow").unwrap();
+    let request_value: serde_json::Value = serde_json::from_str(&request).unwrap();
+    let measured_rows = request_value["rows"].as_array().unwrap().iter().map(|row| serde_json::json!({"uri":row["uri"],"width":440,"status":"ready","line_count":1,"line_height":18,"baseline_offset":14,"body_height":18,"continuation":false})).collect::<Vec<_>>();
+    let reply = serde_json::json!({"schema":1,"stamp":request_value["stamp"],"rows":measured_rows});
+    guest
+        .set_global_json("__bskyVisibleMeasurement", &reply.to_string(), deadline)
+        .unwrap();
+    let candidates = serde_json::to_string(&request_value).unwrap();
+    assert!(!guest
+        .eval_global(&format!(
+            "globalThis.__bskyVisibleCandidates(JSON.stringify({candidates}))"
+        ))
+        .unwrap()
+        .is_empty());
+    guest
+        .eval_global(
+            "globalThis.__bskyVisibleMeasured(JSON.stringify(globalThis.__bskyVisibleMeasurement))",
+        )
+        .unwrap();
+    let initial: serde_json::Value = serde_json::from_str(
+        &guest
+            .eval_global("globalThis.__bskyVisiblePlacement")
+            .unwrap(),
+    )
+    .unwrap();
+    let initial_y = initial["rows"][0]["y"].as_i64().unwrap();
+
+    let snapshot = bsky_pocket::TouchSnapshot::from_contacts([bsky_pocket::TouchContact {
+        id: 9,
+        x: 456,
+        y: 100,
+    }]);
+    guest
+        .set_touch_snapshot(snapshot, deadline)
+        .expect("initial rail contact reaches guest");
+    guest.eval_global("globalThis.__bskyTouchFrame()").unwrap();
+    let snapshot = bsky_pocket::TouchSnapshot::from_contacts([bsky_pocket::TouchContact {
+        id: 9,
+        x: 400,
+        y: 70,
+    }]);
+    guest
+        .set_touch_snapshot(snapshot, deadline)
+        .expect("captured drag reaches guest");
+    guest.eval_global("globalThis.__bskyTouchFrame()").unwrap();
+    let dragged: serde_json::Value = serde_json::from_str(
+        &guest
+            .eval_global("globalThis.__bskyVisiblePlacement")
+            .unwrap(),
+    )
+    .unwrap();
+    let dragged_y = dragged["rows"][0]["y"].as_i64().unwrap();
+    assert!(
+        dragged_y != initial_y,
+        "drag must update published viewport placement: {initial_y} -> {dragged_y}"
+    );
+
+    guest
+        .set_touch_snapshot(bsky_pocket::TouchSnapshot::default(), deadline)
+        .expect("touch release reaches guest");
+    guest.eval_global("globalThis.__bskyTouchFrame()").unwrap();
+    let before_button: serde_json::Value = serde_json::from_str(
+        &guest
+            .eval_global("globalThis.__bskyVisiblePlacement")
+            .unwrap(),
+    )
+    .unwrap();
+    let before_button_y = before_button["rows"][0]["y"].as_i64().unwrap();
+
+    guest
+        .advance_with_deadline(0x0040, deadline)
+        .expect("D-pad advances after touch scroll");
+    guest
+        .present_with_deadline(deadline)
+        .expect("combined touch and D-pad frame presents");
+    let after_press: serde_json::Value = serde_json::from_str(
+        &guest
+            .eval_global("globalThis.__bskyVisiblePlacement")
+            .unwrap(),
+    )
+    .unwrap();
+    let after_press_y = after_press["rows"][0]["y"].as_i64().unwrap();
+    assert!(
+        after_press_y < before_button_y,
+        "DOWN press must move viewport placement: {before_button_y} -> {after_press_y}"
+    );
+
+    guest
+        .advance_with_deadline(0, deadline)
+        .expect("D-pad release advances after touch scroll");
+    guest
+        .present_with_deadline(deadline)
+        .expect("released D-pad frame presents");
+    let after_release: serde_json::Value = serde_json::from_str(
+        &guest
+            .eval_global("globalThis.__bskyVisiblePlacement")
+            .unwrap(),
+    )
+    .unwrap();
+    let after_release_y = after_release["rows"][0]["y"].as_i64().unwrap();
+    assert_eq!(
+        after_release_y, after_press_y,
+        "D-pad release must preserve viewport placement"
+    );
+    assert_eq!(
+        before_button_y - after_press_y,
+        24,
+        "DOWN press should scroll one expected 24px step"
+    );
+    assert!(
+        after_release["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["uri"] == "at://touch-1"),
+        "D-pad selection remains active after touch scrolling: {after_release}"
+    );
+}
+
+#[test]
 fn advance_only_defers_raster_until_explicit_present_and_legacy_frame_still_presents() {
     let mut guest = EmbeddedGuest::new(480, 272).expect("runtime initializes");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
@@ -68,8 +199,15 @@ fn packaged_guest_selects_and_measures_history_beyond_initial_window() {
         serde_json::from_str(&guest.eval_global("globalThis.__bskyVisibleWindow").unwrap())
             .unwrap();
     let initial_rows = initial_window["rows"].as_array().unwrap();
-    assert!(!initial_rows.is_empty(), "initial viewport must expose at least one row");
-    assert!(initial_rows.len() <= 3, "initial measurement batch is bounded to three rows: {}", initial_rows.len());
+    assert!(
+        !initial_rows.is_empty(),
+        "initial viewport must expose at least one row"
+    );
+    assert!(
+        initial_rows.len() <= 3,
+        "initial measurement batch is bounded to three rows: {}",
+        initial_rows.len()
+    );
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     // Establish the first selection, then verify UP clamps at the boundary.
     for button in [0x0040, 0x0010] {
@@ -280,38 +418,155 @@ fn packaged_guest_retains_cached_placement_and_positions_measured_rows_after_pen
     guest.eval("globalThis.__bskyHistoryRevision=1").unwrap();
     guest.deliver_feed_json(&feed.to_string()).unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    let request: MeasureRequest = serde_json::from_str(&guest.eval_global("globalThis.__bskyVisibleWindow").unwrap()).unwrap();
+    let request: MeasureRequest =
+        serde_json::from_str(&guest.eval_global("globalThis.__bskyVisibleWindow").unwrap())
+            .unwrap();
     let measured_request = serde_json::json!({"schema":1,"stamp":request.stamp,"rows":[{"uri":"at://pending","width":440},{"uri":"at://measured","width":440}]});
-    let active_measurement_request: MeasureRequest = serde_json::from_value(measured_request.clone()).unwrap();
-    assert!(!guest.eval_global(&format!("globalThis.__bskyVisibleCandidates(JSON.stringify({measured_request}))")).unwrap().is_empty());
+    let active_measurement_request: MeasureRequest =
+        serde_json::from_value(measured_request.clone()).unwrap();
+    assert!(!guest
+        .eval_global(&format!(
+            "globalThis.__bskyVisibleCandidates(JSON.stringify({measured_request}))"
+        ))
+        .unwrap()
+        .is_empty());
     let request = active_measurement_request.clone();
     let reply = MeasureReply {
         schema: 1,
         stamp: request.stamp.clone(),
-        rows: vec![MeasureResult { uri: "at://pending".into(), status: MeasureStatus::Ready, width: 440, line_count: 1, line_height: 18, baseline_offset: 14, body_height: 18, continuation: false }, MeasureResult { uri: "at://measured".into(), status: MeasureStatus::Ready, width: 440, line_count: 1, line_height: 18, baseline_offset: 14, body_height: 18, continuation: false }],
+        rows: vec![
+            MeasureResult {
+                uri: "at://pending".into(),
+                status: MeasureStatus::Ready,
+                width: 440,
+                line_count: 1,
+                line_height: 18,
+                baseline_offset: 14,
+                body_height: 18,
+                continuation: false,
+            },
+            MeasureResult {
+                uri: "at://measured".into(),
+                status: MeasureStatus::Ready,
+                width: 440,
+                line_count: 1,
+                line_height: 18,
+                baseline_offset: 14,
+                body_height: 18,
+                continuation: false,
+            },
+        ],
     };
-    guest.set_global_json("__bskyVisibleMeasurement", &reply.to_bounded_json().unwrap(), deadline).unwrap();
-    guest.eval_global("globalThis.__bskyVisibleMeasured(JSON.stringify(globalThis.__bskyVisibleMeasurement))").unwrap();
-    let placement: serde_json::Value = serde_json::from_str(&guest.eval_global("globalThis.__bskyVisiblePlacement").unwrap()).unwrap();
-    assert!(placement["rows"].as_array().unwrap().iter().any(|row| row["uri"] == "at://measured"), "measured placement is preserved: {placement}");
-    let measured_y = placement["rows"].as_array().unwrap().iter().find(|row| row["uri"] == "at://measured").unwrap()["y"].as_i64().unwrap();
-    assert!(measured_y >= 120, "second row includes pending first-row estimate: {measured_y}");
+    guest
+        .set_global_json(
+            "__bskyVisibleMeasurement",
+            &reply.to_bounded_json().unwrap(),
+            deadline,
+        )
+        .unwrap();
+    guest
+        .eval_global(
+            "globalThis.__bskyVisibleMeasured(JSON.stringify(globalThis.__bskyVisibleMeasurement))",
+        )
+        .unwrap();
+    let placement: serde_json::Value = serde_json::from_str(
+        &guest
+            .eval_global("globalThis.__bskyVisiblePlacement")
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        placement["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["uri"] == "at://measured"),
+        "measured placement is preserved: {placement}"
+    );
+    let measured_y = placement["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["uri"] == "at://measured")
+        .unwrap()["y"]
+        .as_i64()
+        .unwrap();
+    assert!(
+        measured_y >= 120,
+        "second row includes pending first-row estimate: {measured_y}"
+    );
     let cached_request = serde_json::json!({"schema":1,"stamp":{"auth_generation":1,"mount_generation":1,"history_revision":1,"layout_id":2},"rows":[{"uri":"at://pending","width":440}]});
-    guest.eval_global(&format!("globalThis.__bskyVisibleCandidates(JSON.stringify({cached_request}))")).unwrap();
-    let retained: serde_json::Value = serde_json::from_str(&guest.eval_global("globalThis.__bskyVisiblePlacement").unwrap()).unwrap();
+    guest
+        .eval_global(&format!(
+            "globalThis.__bskyVisibleCandidates(JSON.stringify({cached_request}))"
+        ))
+        .unwrap();
+    let retained: serde_json::Value = serde_json::from_str(
+        &guest
+            .eval_global("globalThis.__bskyVisiblePlacement")
+            .unwrap(),
+    )
+    .unwrap();
     assert_eq!(retained["stamp"]["layout_id"], 2);
-    assert!(retained["rows"].as_array().unwrap().iter().any(|row| row["uri"] == "at://measured"), "cached placement survives a candidate with no reply: {retained}");
+    assert!(
+        retained["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["uri"] == "at://measured"),
+        "cached placement survives a candidate with no reply: {retained}"
+    );
 
     let viewport_request: MeasureRequest = serde_json::from_str(
-        &guest.eval_global("globalThis.__bskyVisibleLayoutRequest").unwrap(),
-    ).unwrap();
-    assert_eq!(viewport_request.rows.iter().map(|row| row.uri.as_str()).collect::<Vec<_>>(), ["at://pending", "at://measured"]);
-    assert_eq!(active_measurement_request.rows.iter().map(|row| row.uri.as_str()).collect::<Vec<_>>(), ["at://pending", "at://measured"]);
+        &guest
+            .eval_global("globalThis.__bskyVisibleLayoutRequest")
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        viewport_request
+            .rows
+            .iter()
+            .map(|row| row.uri.as_str())
+            .collect::<Vec<_>>(),
+        ["at://pending", "at://measured"]
+    );
+    assert_eq!(
+        active_measurement_request
+            .rows
+            .iter()
+            .map(|row| row.uri.as_str())
+            .collect::<Vec<_>>(),
+        ["at://pending", "at://measured"]
+    );
     let retained_placement: PlacementMessage = serde_json::from_value(retained).unwrap();
-    retained_placement.validate_for(&viewport_request, &[
-        MeasureResult { uri: "at://pending".into(), status: MeasureStatus::Ready, width: 440, line_count: 1, line_height: 18, baseline_offset: 14, body_height: 18, continuation: false },
-        MeasureResult { uri: "at://measured".into(), status: MeasureStatus::Ready, width: 440, line_count: 1, line_height: 18, baseline_offset: 14, body_height: 18, continuation: false },
-    ]).expect("cached viewport row validates independently of active measurement candidates");
+    retained_placement
+        .validate_for(
+            &viewport_request,
+            &[
+                MeasureResult {
+                    uri: "at://pending".into(),
+                    status: MeasureStatus::Ready,
+                    width: 440,
+                    line_count: 1,
+                    line_height: 18,
+                    baseline_offset: 14,
+                    body_height: 18,
+                    continuation: false,
+                },
+                MeasureResult {
+                    uri: "at://measured".into(),
+                    status: MeasureStatus::Ready,
+                    width: 440,
+                    line_count: 1,
+                    line_height: 18,
+                    baseline_offset: 14,
+                    body_height: 18,
+                    continuation: false,
+                },
+            ],
+        )
+        .expect("cached viewport row validates independently of active measurement candidates");
 }
 
 #[test]

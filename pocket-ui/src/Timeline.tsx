@@ -16,6 +16,7 @@ import {
   layoutRows,
   scrollWindow,
   preserveAnchorOffset,
+  reduceTouchRail,
   ROW_LAYOUT,
   moveSelection,
   reduceTimelineScroll,
@@ -39,6 +40,7 @@ export function Timeline() {
   const measured = new Set<string>();
   let active: MeasureRequest | null = null;
   let currentStamp: Stamp | null = null;
+  let touchRail: import("./visible_text").TouchRailState = { kind: "idle" };
   const historyMetrics = (history: FeedDelivery["posts"]) => history.flatMap((post) => {
     const cached = metricsByUri.get(post.uri);
     return cached
@@ -231,6 +233,26 @@ export function Timeline() {
   };
   const selectPrevious = () => publishSelection(-1);
   const selectNext = () => publishSelection(1);
+  globalThis.__bskyTouchFrame = () => {
+    let contacts: import("./visible_text").TouchContact[] = [];
+    try {
+      const value: unknown = globalThis.__bskyTouch;
+      if (typeof value === "object" && value !== null && "contacts" in value && Array.isArray(value.contacts)) {
+        contacts = value.contacts.slice(0, 6).filter((point): point is import("./visible_text").TouchContact =>
+          typeof point === "object" && point !== null && "id" in point && "x" in point && "y" in point &&
+          Number.isInteger(point.id) && point.id >= 0 && point.id <= 255 &&
+          Number.isFinite(point.x) && Number.isFinite(point.y));
+      }
+    } catch { contacts = []; }
+    const next = reduceTouchRail(touchRail, contacts);
+    touchRail = next.state;
+    if (next.delta !== 0 && next.state.kind === "captured" && next.state.dragging) {
+      const history = delivery()?.posts ?? [];
+      const updated = scrollWindow(history, heights, scrollOffset() + next.delta, ROW_LAYOUT.viewportHeight - ROW_LAYOUT.top - ROW_LAYOUT.bottom, 64);
+      setScrollOffset(updated.offset);
+      if (currentStamp) publishViewport(history, updated.offset, currentStamp);
+    }
+  };
   const status = () =>
     error() ||
     (!delivery()
@@ -371,6 +393,8 @@ export function Timeline() {
 }
 declare global {
   var __bskyVisibleWindow: string;
+  var __bskyTouch: { contacts: unknown[] };
+  var __bskyTouchFrame: () => void;
   var __bskyAuthGeneration: number;
   var __bskyMountGeneration: number;
   var __bskyHistoryRevision: number;

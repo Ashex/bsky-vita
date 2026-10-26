@@ -1,4 +1,4 @@
-use bsky_input::{buttons, PadFrame};
+use bsky_input::{buttons, PadFrame, TouchFrame};
 use bsky_pocket::text_batch::pack_lines;
 use bsky_pocket::{EmbeddedGuest, NativeCommand};
 use bsky_render::{Font, Frame, Texture};
@@ -128,6 +128,7 @@ impl PocketShell {
     pub fn prepare(&mut self, pad: &PadFrame, font: &Font) -> Result<(), String> {
         self.prepare_until(
             pad,
+            &TouchFrame::default(),
             font,
             std::time::Instant::now() + bsky_pocket::frame_budget(),
         )
@@ -135,6 +136,7 @@ impl PocketShell {
     pub fn prepare_until(
         &mut self,
         pad: &PadFrame,
+        touch: &TouchFrame,
         font: &Font,
         deadline: std::time::Instant,
     ) -> Result<(), String> {
@@ -194,6 +196,17 @@ impl PocketShell {
                 .command(bsky_feed::FeedCommand::Leave);
             self.accept_effects(effects);
         }
+        let touch_snapshot =
+            bsky_pocket::TouchSnapshot::from_contacts(touch.points.iter().map(|point| {
+                bsky_pocket::TouchContact {
+                    id: point.id,
+                    x: (point.x.clamp(0, 960) / 2) as u16,
+                    y: (point.y.clamp(0, 544) / 2) as u16,
+                }
+            }));
+        self.guest.set_touch_snapshot(touch_snapshot, deadline)?;
+        self.guest
+            .eval_global_with_deadline("globalThis.__bskyTouchFrame()", deadline)?;
         self.guest
             .advance_with_deadline(crate::pocket_input::guest_buttons(pad.current), deadline)?;
         self.native_batch = self.guest.native_batch_with_budget(
