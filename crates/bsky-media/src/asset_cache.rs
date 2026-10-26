@@ -272,6 +272,25 @@ mod tests {
     }
 
     #[test]
+    fn stale_avatar_bytes_are_available_without_scheduling_fetch() {
+        let d = tempfile::tempdir().unwrap();
+        let c = AssetCache::new(d.path());
+        let k = key("same");
+        c.put(&k, AssetKind::Avatar { followed: false }, b"cached-image")
+            .unwrap();
+        let cached = c
+            .get(
+                &k,
+                AssetKind::Avatar { followed: false },
+                SystemTime::now() + OTHER_TTL,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(!cached.1.fresh);
+        assert_eq!(cached.0, b"cached-image");
+    }
+
+    #[test]
     fn changed_identity_is_a_miss() {
         let d = tempfile::tempdir().unwrap();
         let c = AssetCache::new(d.path());

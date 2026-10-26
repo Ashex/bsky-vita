@@ -40,6 +40,8 @@ mod video_shader;
 #[cfg(target_os = "vita")]
 mod video_shader_src;
 
+pub mod pocket_icon_table;
+
 /// A YUV420 video frame as three GXM-bindable luma-format textures
 /// (Y at full resolution, U/V at half). Unique to video playback —
 /// consumed only by [`Frame::draw_video_yuv`]. Created with
