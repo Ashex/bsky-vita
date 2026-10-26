@@ -406,6 +406,7 @@ fn main() {
         #[cfg(feature = "pocketjs-poc")]
         if session_dead {
             pocket_media.invalidate();
+            texture_cache.clear();
             auth_generation = auth_generation.wrapping_add(1).max(1);
             let effects = pocket_coordinator
                 .lock()
@@ -451,6 +452,7 @@ fn main() {
                     #[cfg(feature = "pocketjs-poc")]
                     {
                         pocket_media.invalidate();
+                        texture_cache.clear();
                         auth_generation = auth_generation.wrapping_add(1).max(1);
                         let effects = pocket_coordinator
                             .lock()
@@ -468,6 +470,7 @@ fn main() {
                     #[cfg(feature = "pocketjs-poc")]
                     {
                         pocket_media.invalidate();
+                        texture_cache.clear();
                         auth_generation = auth_generation.wrapping_add(1).max(1);
                         let effects = pocket_coordinator
                             .lock()

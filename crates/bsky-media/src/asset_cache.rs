@@ -122,14 +122,20 @@ impl AssetCache {
     }
 
     fn entry_path(&self, key: &AssetIdentityKey) -> PathBuf {
-        // Hex encoding prevents path traversal and safely incorporates all
-        // account, generation, and source-revision identity components.
+        // A stable 128-bit FNV-1a hash of the raw key. Encoding the full key
+        // as hex could exceed the filesystem NAME_MAX (255 bytes) for long
+        // source URLs; a fixed-width digest keeps every entry name bounded
+        // while still separating accounts, generations, and revisions.
         let raw = format!(
             "{}\0{}\0{}",
             key.scope_did, key.auth_generation, key.identity_tag
         );
-        let name: String = raw.bytes().map(|b| format!("{b:02x}")).collect();
-        self.root.join(format!("{name}.media"))
+        let mut hash: u128 = 0x0000_0000_0000_0000_6c62_2ac9_2a35_9f4b;
+        for byte in raw.bytes() {
+            hash ^= u128::from(byte);
+            hash = hash.wrapping_mul(0x0000_0000_0000_0100_0000_0000_0000_013b);
+        }
+        self.root.join(format!("{hash:032x}.media"))
     }
 
     fn evict(&self) -> io::Result<()> {
@@ -288,6 +294,39 @@ mod tests {
             .unwrap();
         assert!(!cached.1.fresh);
         assert_eq!(cached.0, b"cached-image");
+    }
+
+    #[test]
+    fn long_identity_produces_a_bounded_filename() {
+        let d = tempfile::tempdir().unwrap();
+        let c = AssetCache::new(d.path());
+        let long = AssetIdentityKey {
+            scope_did: "did:plc:account".into(),
+            auth_generation: 1,
+            identity_tag: format!("avatar:did:plc:author:{}", "x".repeat(4096)),
+        };
+        c.put(&long, AssetKind::Avatar { followed: false }, b"bytes")
+            .unwrap();
+        assert_eq!(
+            c.get(
+                &long,
+                AssetKind::Avatar { followed: false },
+                SystemTime::now()
+            )
+            .unwrap()
+            .unwrap()
+            .0,
+            b"bytes"
+        );
+        let names: Vec<_> = fs::read_dir(d.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.iter().all(|n| n.len() <= 255),
+            "entry names must stay within NAME_MAX: {names:?}"
+        );
     }
 
     #[test]

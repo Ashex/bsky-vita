@@ -1400,9 +1400,16 @@ impl TextureCache {
     pub fn len(&self) -> usize {
         self.map.len()
     }
-
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
+    }
+
+    /// Drop every cached texture. Use on account teardown so a previously
+    /// signed-in account's decoded images are not served to the next one.
+    /// Dropping each `Texture` releases its GPU memory.
+    pub fn clear(&mut self) {
+        self.map.clear();
+        self.order.clear();
     }
 }
 
@@ -2299,6 +2306,16 @@ mod tests {
         assert!(cache.resolve_handle(&handles, 1).is_none());
         assert!(cache.resolve_handle(&handles, 9).is_none());
         assert!(cache.resolve_handle(&handles, 2).is_none());
+    }
+
+    #[test]
+    fn texture_cache_clear_drops_every_entry() {
+        let mut cache = TextureCache::new(8);
+        assert!(cache.is_empty());
+        cache.clear();
+        assert_eq!(cache.len(), 0);
+        assert!(!cache.contains("anything"));
+        assert!(cache.get("anything").is_none());
     }
 
     #[test]
