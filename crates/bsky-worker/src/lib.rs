@@ -78,7 +78,7 @@ use crossbeam_channel::{bounded, unbounded, Receiver, Sender, TryRecvError};
 use futures::executor::block_on;
 use std::time::{Duration, Instant};
 mod feed_projection;
-use feed_projection::project_page;
+use feed_projection::{project_page, project_page_with_native};
 
 /// Identifies which feed a `FetchFeed` request targets.
 ///
@@ -131,6 +131,12 @@ pub enum WorkRequest {
     },
     /// Additive PocketJS feed operation. Identity is captured by the caller before enqueue.
     FetchFeedCorrelated {
+        correlation: FeedCorrelation,
+        deadline: Option<Instant>,
+        source: FeedSource,
+        cursor: Option<String>,
+    },
+    FetchFeedProjected {
         correlation: FeedCorrelation,
         deadline: Option<Instant>,
         source: FeedSource,
@@ -395,6 +401,10 @@ pub enum WorkResponse {
         correlation: FeedCorrelation,
         batch: Result<FeedDelivery, String>,
     },
+    FeedPageProjected {
+        correlation: FeedCorrelation,
+        batch: Result<bsky_feed::ProjectedFeed, String>,
+    },
     /// User's pinned saved feeds (already hydrated with display metadata).
     SavedFeeds(Result<SavedFeedsBatch, String>),
     /// Raw bytes of the requested image. Caller decodes with
@@ -505,6 +515,7 @@ impl WorkResponse {
             WorkResponse::Profile(Err(e)) => Some(e),
             WorkResponse::FeedPage { batch: Err(e), .. } => Some(e),
             WorkResponse::FeedPageCorrelated { batch: Err(e), .. } => Some(e),
+            WorkResponse::FeedPageProjected { batch: Err(e), .. } => Some(e),
             WorkResponse::SavedFeeds(Err(e)) => Some(e),
             WorkResponse::PostCreated(Err(e)) => Some(e),
             WorkResponse::PostDeleted { result: Err(e), .. } => Some(e),
@@ -539,21 +550,61 @@ impl WorkResponse {
 const RESPONSE_CAP: usize = 128;
 const REQUEST_DEADLINE: Duration = Duration::from_secs(45);
 
-fn admit_feed_request(
-    correlation: FeedCorrelation,
-    source: FeedSource,
-    cursor: Option<String>,
-) -> WorkRequest {
-    WorkRequest::FetchFeedCorrelated {
-        correlation,
-        source,
-        cursor,
-        deadline: Some(Instant::now() + REQUEST_DEADLINE),
+fn feed_source_key(source: &FeedSource) -> String {
+    match source {
+        FeedSource::Following => "following".into(),
+        FeedSource::Feed(uri) => format!("feed:{uri}"),
+        FeedSource::AuthorPosts { actor } => format!("author_posts:{actor}"),
+        FeedSource::AuthorReplies { actor } => format!("author_replies:{actor}"),
+        FeedSource::AuthorMedia { actor } => format!("author_media:{actor}"),
+        FeedSource::AuthorLikes { actor } => format!("author_likes:{actor}"),
     }
+}
+
+fn admit_feed_request(req: WorkRequest) -> WorkRequest {
+    match req {
+        WorkRequest::FetchFeedCorrelated { correlation, source, cursor, deadline } => WorkRequest::FetchFeedCorrelated {
+            correlation, source, cursor, deadline: Some(deadline.unwrap_or_else(|| Instant::now() + REQUEST_DEADLINE)),
+        },
+        WorkRequest::FetchFeedProjected { correlation, source, cursor, deadline } => WorkRequest::FetchFeedProjected {
+            correlation, source, cursor, deadline: Some(deadline.unwrap_or_else(|| Instant::now() + REQUEST_DEADLINE)),
+        },
+        req => req,
+    }
+}
+
+fn feed_correlation_preflight(
+    correlation: &FeedCorrelation,
+    source: &FeedSource,
+    cursor: Option<&str>,
+    resolved_did: &str,
+    request_id: u64,
+) -> bool {
+    if correlation.validate().is_err()
+        || correlation.source != feed_source_key(source)
+        || correlation.cursor.as_deref() != cursor
+    {
+        return false;
+    }
+    if request_id != 0 && correlation.request_id == 0 {
+        return false;
+    }
+    if request_id != 0 && resolved_did.is_empty() {
+        return false;
+    }
+    true
 }
 
 fn expired_feed_response(req: &WorkRequest, now: Instant) -> Option<WorkResponse> {
     match req {
+        WorkRequest::FetchFeedProjected {
+            correlation,
+            deadline: Some(deadline),
+            ..
+        } if now >= *deadline => Some(WorkResponse::FeedPageProjected {
+            correlation: correlation.clone(),
+            batch: Err("feed request deadline exceeded".into()),
+        }),
         WorkRequest::FetchFeedCorrelated {
             correlation,
             deadline: Some(deadline),
@@ -583,7 +634,9 @@ mod deadline_tests {
 
     #[test]
     fn correlated_request_deadline_includes_queue_wait() {
-        let request = admit_feed_request(correlation(), FeedSource::Following, None);
+        let request = admit_feed_request(WorkRequest::FetchFeedCorrelated {
+            correlation: correlation(), source: FeedSource::Following, cursor: None, deadline: None,
+        });
         let original_deadline = match &request {
             WorkRequest::FetchFeedCorrelated { deadline, .. } => deadline.unwrap(),
             _ => unreachable!(),
@@ -598,6 +651,22 @@ mod deadline_tests {
             later
         )
         .is_none());
+    }
+
+    #[test]
+    fn admission_preserves_correlated_response_contract() {
+        let request = admit_feed_request(WorkRequest::FetchFeedCorrelated {
+            correlation: correlation(), source: FeedSource::Following, cursor: None, deadline: None,
+        });
+        assert!(matches!(request, WorkRequest::FetchFeedCorrelated { deadline: Some(_), .. }));
+    }
+
+    #[test]
+    fn projected_auth_errors_are_classified_for_session_teardown() {
+        let response = WorkResponse::FeedPageProjected {
+            correlation: correlation(), batch: Err("invalid_token".into()),
+        };
+        assert!(response.auth_failed());
     }
 
     #[test]
@@ -659,15 +728,7 @@ impl Worker {
         // the shared texture cache that satisfies every waiting caller. Keyed
         // on the same string the `Image` response echoes back, so `try_recv`
         // can clear it.
-        let req = match req {
-            WorkRequest::FetchFeedCorrelated {
-                correlation,
-                source,
-                cursor,
-                deadline: None,
-            } => admit_feed_request(correlation, source, cursor),
-            other => other,
-        };
+        let req = admit_feed_request(req);
         if let Some(key) = image_request_key(&req) {
             if !self.inflight.borrow_mut().insert(key) {
                 return;
@@ -712,7 +773,8 @@ fn image_request_key(req: &WorkRequest) -> Option<String> {
 fn run(client: Arc<AuthClient>, requests: Receiver<WorkRequest>, responses: Sender<WorkResponse>) {
     while let Ok(req) = requests.recv() {
         let resp = match &req {
-            WorkRequest::FetchFeedCorrelated { deadline, .. } => {
+            WorkRequest::FetchFeedCorrelated { deadline, .. }
+            | WorkRequest::FetchFeedProjected { deadline, .. } => {
                 if let Some(response) = expired_feed_response(&req, Instant::now()) {
                     response
                 } else {
@@ -858,6 +920,52 @@ fn handle_request(
             }
         }
         WorkRequest::FetchFeed { source, cursor } => fetch_feed_page(client, source, cursor),
+        WorkRequest::FetchFeedProjected {
+            correlation,
+            source,
+            cursor,
+            deadline,
+        } => {
+            let mut result = if deadline.is_some_and(|d| Instant::now() >= d) {
+                Err("feed request deadline exceeded".into())
+            } else if !feed_correlation_preflight(
+                &correlation,
+                &source,
+                cursor.as_deref(),
+                &client.resolved.did,
+                correlation.request_id,
+            ) {
+                Err("invalid feed correlation".into())
+            } else {
+                match fetch_feed_page(client, source.clone(), cursor.clone()) {
+                    WorkResponse::FeedPage {
+                        batch: Ok(batch), ..
+                    } => {
+                        if deadline.is_some_and(|d| Instant::now() >= d) {
+                            Err("feed request deadline exceeded".into())
+                        } else {
+                            project_page_with_native(
+                                correlation.clone(),
+                                batch.posts,
+                                batch.cursor,
+                                Some(client.resolved.did.to_string()),
+                            )
+                        }
+                    }
+                    WorkResponse::FeedPage {
+                        batch: Err(error), ..
+                    } => Err(error),
+                    _ => unreachable!(),
+                }
+            };
+            if deadline.is_some_and(|d| Instant::now() >= d) {
+                result = Err("feed request deadline exceeded".into());
+            }
+            WorkResponse::FeedPageProjected {
+                correlation,
+                batch: result,
+            }
+        }
         WorkRequest::FetchFeedCorrelated {
             correlation,
             source,
@@ -869,10 +977,13 @@ fn handle_request(
                     correlation,
                     batch: Err("feed request deadline exceeded".into()),
                 }
-            } else if correlation.validate().is_err()
-                || correlation.source != format!("{source:?}")
-                || correlation.cursor != cursor
-            {
+            } else if !feed_correlation_preflight(
+                &correlation,
+                &source,
+                cursor.as_deref(),
+                "",
+                0,
+            ) {
                 WorkResponse::FeedPageCorrelated {
                     correlation,
                     batch: Err("invalid feed correlation".into()),
@@ -885,7 +996,7 @@ fn handle_request(
                         batch: Err("feed request deadline exceeded".into()),
                     };
                 }
-                let batch = match response {
+                let mut batch = match response {
                     WorkResponse::FeedPage {
                         batch: Ok(batch), ..
                     } => project_page(correlation.clone(), batch.posts, batch.cursor),
@@ -894,6 +1005,9 @@ fn handle_request(
                     } => Err(error),
                     _ => unreachable!(),
                 };
+                if deadline.is_some_and(|d| Instant::now() >= d) {
+                    batch = Err("feed request deadline exceeded".into());
+                }
                 WorkResponse::FeedPageCorrelated { correlation, batch }
             }
         }

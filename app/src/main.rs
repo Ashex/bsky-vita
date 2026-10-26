@@ -51,7 +51,7 @@ fn run_pocket_effects(
         match effect {
             bsky_feed::FeedEffect::FetchPage(correlation) => {
                 if let Some(worker) = worker {
-                    worker.send(WorkRequest::FetchFeedCorrelated {
+                    worker.send(WorkRequest::FetchFeedProjected {
                         source: bsky_worker::FeedSource::Following,
                         cursor: correlation.cursor.clone(),
                         correlation: bsky_feed::FeedCorrelation {
@@ -338,13 +338,14 @@ fn main() {
                 let dead = resp.auth_failed();
                 #[cfg(feature = "pocketjs-poc")]
                 let dead = match &resp {
-                    WorkResponse::FeedPageCorrelated { correlation, .. } => {
+                    WorkResponse::FeedPageCorrelated { correlation, .. }
+                    | WorkResponse::FeedPageProjected { correlation, .. } => {
                         dead && correlation.auth_generation == frame_auth_generation
                     }
                     _ => dead,
                 };
                 #[cfg(feature = "pocketjs-poc")]
-                if let WorkResponse::FeedPageCorrelated { correlation, batch } = &resp {
+                if let WorkResponse::FeedPageProjected { correlation, batch } = &resp {
                     let converted = bsky_feed::FeedCorrelation {
                         schema: correlation.schema,
                         auth_generation: correlation.auth_generation,
@@ -353,7 +354,7 @@ fn main() {
                         source: correlation.source.clone(),
                         cursor: correlation.cursor.clone(),
                     };
-                    let result = batch.clone();
+                    let result = batch.as_ref().map(|projected| projected.delivery.clone()).map_err(Clone::clone);
                     let effects = pocket_coordinator.lock().unwrap().handle(
                         bsky_feed::FeedEvent::Completed {
                             correlation: converted,

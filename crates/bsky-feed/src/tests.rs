@@ -48,6 +48,86 @@ fn context_marker_is_bounded_typed_and_legacy_missing_field_defaults() {
 }
 
 #[test]
+fn native_media_contract_is_non_serializable_scope_bound_and_distinct_from_guest_dto() {
+    let scope = AccountScope {
+        account_did: "did:plc:account".into(),
+        auth_generation: 9,
+    };
+    let first = AssetIdentity::PostImage {
+        post_uri: "at://did:plc:a/app.bsky.feed.post/1".into(),
+        cid: "cid1".into(),
+        index: 0,
+        thumbnail: "https://cdn.example/thumb".into(),
+        fullsize: "https://cdn.example/full".into(),
+    };
+    let second = AssetIdentity::PostImage {
+        post_uri: "at://did:plc:a/app.bsky.feed.post/1".into(),
+        cid: "cid2".into(),
+        index: 0,
+        thumbnail: "https://cdn.example/thumb".into(),
+        fullsize: "https://cdn.example/full".into(),
+    };
+    assert_ne!(first, second);
+    let descriptor = NativeAssetDescriptor {
+        scope,
+        identity: first.clone(),
+        handle: "asset:1:0:0".into(),
+        relationship: Relationship::Unknown,
+        following_confirmed: false,
+    };
+    assert_eq!(descriptor.relationship, Relationship::Unknown);
+    let delivery = FeedDelivery {
+        schema: SCHEMA_VERSION,
+        correlation: {
+            let mut value = correlation(1, 1);
+            value.auth_generation = 9;
+            value
+        },
+        posts: vec![post(
+            "at://did:plc:a/app.bsky.feed.post/1",
+            ContentState::Clean,
+        )],
+        cursor: None,
+    };
+    let mut matching_descriptor = descriptor.clone();
+    matching_descriptor.identity = first;
+    let envelope = NativeFeedEnvelope {
+        correlation: delivery.correlation.clone(),
+        descriptors: vec![matching_descriptor],
+    };
+    let mut image_delivery = delivery.clone();
+    image_delivery.posts[0].images.clear();
+    assert!(!envelope.matches_for(&image_delivery, "did:plc:account"));
+    let mut image_envelope = envelope.clone();
+    image_envelope.descriptors[0].identity = AssetIdentity::Avatar {
+        author_did: "did:plc:a".into(),
+        source_revision: "avatar-revision".into(),
+    };
+    image_envelope.descriptors[0].handle = "asset:1:0:avatar".into();
+    assert!(image_envelope.matches_for(&delivery, "did:plc:account"));
+    assert!(!envelope.matches_for(&delivery, "did:plc:another-account"));
+    let mut wrong_scope = descriptor.clone();
+    wrong_scope.scope.account_did = "did:plc:another-account".into();
+    assert_ne!(descriptor.scope, wrong_scope.scope);
+    let mut mismatch = envelope.clone();
+    mismatch.correlation.request_id += 1;
+    assert!(!mismatch.matches_for(&delivery, "did:plc:account"));
+    assert_ne!(
+        AccountScope {
+            account_did: "did:plc:account".into(),
+            auth_generation: 9
+        },
+        AccountScope {
+            account_did: "did:plc:another-account".into(),
+            auth_generation: 9
+        }
+    );
+    let json = serde_json::to_string(&post("post", ContentState::Clean)).unwrap();
+    assert!(!json.contains("cdn.example"));
+    assert!(!json.contains("asset:1:0:0"));
+}
+
+#[test]
 fn content_state_wire_format_is_explicit_and_null_is_rejected() {
     let clean = serde_json::to_value(ContentState::Clean).unwrap();
     assert_eq!(clean, serde_json::json!({"state":"clean"}));
@@ -372,6 +452,15 @@ fn field_and_delivery_limits_are_explicit() {
 }
 
 #[test]
+fn relationships_never_report_not_followed() {
+    let followed = Relationship::Followed;
+    let unknown = Relationship::Unknown;
+    assert_ne!(followed, unknown);
+    let source = include_str!("media_types.rs");
+    assert!(!source.contains("NotFollowed"));
+}
+
+#[test]
 fn history_uses_serialized_json_size_across_pages_and_trims_before_overshoot() {
     let mut history = FeedHistory::default();
     let mut rows = Vec::new();
@@ -458,4 +547,416 @@ fn history_caps_count_before_accepting_more_than_two_hundred_rows() {
         .unwrap();
     assert_eq!(history.posts().len(), MAX_HISTORY);
     assert_eq!(history.posts().back().unwrap().uri, "latest");
+}
+
+fn make_delivery(
+    correlation: FeedCorrelation,
+    posts: Vec<PostDto>,
+) -> FeedDelivery {
+    FeedDelivery {
+        schema: SCHEMA_VERSION,
+        correlation,
+        posts,
+        cursor: None,
+    }
+}
+
+fn make_avatar_envelope(
+    correlation: &FeedCorrelation,
+    account_did: &str,
+    handle: &str,
+    author_did: &str,
+    revision: &str,
+) -> NativeFeedEnvelope {
+    NativeFeedEnvelope {
+        correlation: correlation.clone(),
+        descriptors: vec![NativeAssetDescriptor {
+            scope: AccountScope {
+                account_did: account_did.into(),
+                auth_generation: correlation.auth_generation,
+            },
+            identity: AssetIdentity::Avatar {
+                author_did: author_did.into(),
+                source_revision: revision.into(),
+            },
+            handle: handle.into(),
+            relationship: Relationship::Unknown,
+            following_confirmed: false,
+        }],
+    }
+}
+
+fn make_image_envelope(
+    correlation: &FeedCorrelation,
+    account_did: &str,
+    handle: &str,
+    post_uri: &str,
+    cid: &str,
+    index: u32,
+) -> NativeFeedEnvelope {
+    NativeFeedEnvelope {
+        correlation: correlation.clone(),
+        descriptors: vec![NativeAssetDescriptor {
+            scope: AccountScope {
+                account_did: account_did.into(),
+                auth_generation: correlation.auth_generation,
+            },
+            identity: AssetIdentity::PostImage {
+                post_uri: post_uri.into(),
+                cid: cid.into(),
+                index,
+                thumbnail: "https://cdn.example/thumb".into(),
+                fullsize: "https://cdn.example/full".into(),
+            },
+            handle: handle.into(),
+            relationship: Relationship::Unknown,
+            following_confirmed: false,
+        }],
+    }
+}
+
+#[test]
+fn envelope_rejects_wrong_account_did_and_invalid_scope_yields_zero_descriptors() {
+    let corr = correlation(1, 1);
+    let delivery = make_delivery(
+        corr.clone(),
+        vec![post("at://did:plc:a/app.bsky.feed.post/0", ContentState::Clean)],
+    );
+    let envelope = make_avatar_envelope(
+        &corr,
+        "did:plc:wrong",
+        "asset:1:0:avatar",
+        "did:plc:a",
+        "rev",
+    );
+    assert!(!envelope.matches_for(&delivery, "did:plc:right"));
+    let empty = NativeFeedEnvelope {
+        correlation: corr.clone(),
+        descriptors: vec![],
+    };
+    assert!(empty.matches_for(&delivery, "did:plc:right"));
+    assert_eq!(empty.descriptors.len(), 0);
+}
+
+#[test]
+fn envelope_rejects_orphan_avatar_not_in_any_clean_post() {
+    let corr = correlation(1, 1);
+    let mut non_clean = post("at://did:plc:a/app.bsky.feed.post/0", ContentState::Blocked);
+    non_clean.author.did = "did:plc:a".into();
+    let delivery = make_delivery(corr.clone(), vec![non_clean]);
+    let envelope = make_avatar_envelope(
+        &corr,
+        "did:plc:account",
+        "asset:1:0:avatar",
+        "did:plc:a",
+        "rev",
+    );
+    assert!(!envelope.matches_for(&delivery, "did:plc:account"));
+}
+
+#[test]
+fn envelope_rejects_image_uri_match_with_wrong_cid() {
+    let corr = correlation(1, 1);
+    let delivery = make_delivery(
+        corr.clone(),
+        vec![post("at://did:plc:a/app.bsky.feed.post/0", ContentState::Clean)],
+    );
+    let envelope = make_image_envelope(
+        &corr,
+        "did:plc:account",
+        "asset:1:0:0",
+        "at://did:plc:a/app.bsky.feed.post/0",
+        "wrong-cid",
+        0,
+    );
+    assert!(!envelope.matches_for(&delivery, "did:plc:account"));
+}
+
+#[test]
+fn envelope_rejects_image_with_wrong_index() {
+    let corr = correlation(1, 1);
+    let delivery = make_delivery(
+        corr.clone(),
+        vec![post("at://did:plc:a/app.bsky.feed.post/0", ContentState::Clean)],
+    );
+    let envelope = make_image_envelope(
+        &corr,
+        "did:plc:account",
+        "asset:1:0:3",
+        "at://did:plc:a/app.bsky.feed.post/0",
+        "cid",
+        3,
+    );
+    assert!(!envelope.matches_for(&delivery, "did:plc:account"));
+}
+
+#[test]
+fn envelope_rejects_duplicate_handle() {
+    let corr = correlation(1, 1);
+    let delivery = make_delivery(
+        corr.clone(),
+        vec![
+            post("at://did:plc:a/app.bsky.feed.post/0", ContentState::Clean),
+            post("at://did:plc:b/app.bsky.feed.post/1", ContentState::Clean),
+        ],
+    );
+    let mut envelope = make_avatar_envelope(
+        &corr,
+        "did:plc:account",
+        "asset:1:0:avatar",
+        "did:plc:a",
+        "rev",
+    );
+    envelope.descriptors.push(NativeAssetDescriptor {
+        scope: AccountScope {
+            account_did: "did:plc:account".into(),
+            auth_generation: corr.auth_generation,
+        },
+        identity: AssetIdentity::Avatar {
+            author_did: "did:plc:b".into(),
+            source_revision: "rev2".into(),
+        },
+        handle: "asset:1:0:avatar".into(),
+        relationship: Relationship::Unknown,
+        following_confirmed: false,
+    });
+    assert!(!envelope.matches_for(&delivery, "did:plc:account"));
+}
+
+#[test]
+fn envelope_rejects_malformed_handle() {
+    let corr = correlation(1, 1);
+    let delivery = make_delivery(
+        corr.clone(),
+        vec![post("at://did:plc:a/app.bsky.feed.post/0", ContentState::Clean)],
+    );
+    for bad_handle in [
+        "",
+        "asset:1:0",
+        "asset:1:0:bad:extra",
+        "asset:1:0:bad",
+        "asset:999:0:avatar",
+        "asset:1:0:not-a-number",
+        "asset:1:not-a-number:avatar",
+        "asset:not-a-number:0:avatar",
+        "native:1:0",
+        "asset:1:-1:avatar",
+    ] {
+        let envelope = make_avatar_envelope(
+            &corr,
+            "did:plc:account",
+            bad_handle,
+            "did:plc:a",
+            "rev",
+        );
+        assert!(
+            !envelope.matches_for(&delivery, "did:plc:account"),
+            "handle '{bad_handle}' should be rejected"
+        );
+    }
+}
+
+#[test]
+fn envelope_rejects_descriptor_limit_boundary_and_excess() {
+    let corr = correlation(1, 1);
+    let mut posts = Vec::new();
+    for n in 0..MAX_HISTORY {
+        let mut p = post(
+            &format!("at://did:plc:a/app.bsky.feed.post/{n}"),
+            ContentState::Clean,
+        );
+        p.images = (0..9)
+            .map(|_| ImageMetadata {
+                alt: "img".into(),
+                width: None,
+                height: None,
+            })
+            .collect();
+        posts.push(p);
+    }
+    let delivery = make_delivery(corr.clone(), posts);
+    let mut envelope = NativeFeedEnvelope {
+        correlation: corr.clone(),
+        descriptors: Vec::new(),
+    };
+    let max_descriptors = MAX_HISTORY * 9;
+    for n in 0..max_descriptors {
+        let post_idx = n / 9;
+        let image_idx = (n % 9) as u32;
+        envelope.descriptors.push(NativeAssetDescriptor {
+            scope: AccountScope {
+                account_did: "did:plc:account".into(),
+                auth_generation: corr.auth_generation,
+            },
+            identity: AssetIdentity::PostImage {
+                post_uri: format!("at://did:plc:a/app.bsky.feed.post/{post_idx}"),
+                cid: "cid".into(),
+                index: image_idx,
+                thumbnail: "https://cdn.example/thumb".into(),
+                fullsize: "https://cdn.example/full".into(),
+            },
+            handle: format!("asset:1:{}:{}", post_idx, image_idx),
+            relationship: Relationship::Unknown,
+            following_confirmed: false,
+        });
+    }
+    assert!(envelope.matches_for(&delivery, "did:plc:account"));
+    envelope.descriptors.push(NativeAssetDescriptor {
+        scope: AccountScope {
+            account_did: "did:plc:account".into(),
+            auth_generation: corr.auth_generation,
+        },
+        identity: AssetIdentity::Avatar {
+            author_did: "did:plc:a".into(),
+            source_revision: "extra".into(),
+        },
+        handle: "asset:1:0:avatar".into(),
+        relationship: Relationship::Unknown,
+        following_confirmed: false,
+    });
+    assert!(!envelope.matches_for(&delivery, "did:plc:account"));
+}
+
+#[test]
+fn envelope_rejects_field_length_boundary_and_excess() {
+    let corr = correlation(1, 1);
+    let delivery = make_delivery(
+        corr.clone(),
+        vec![post("at://did:plc:a/app.bsky.feed.post/0", ContentState::Clean)],
+    );
+    let ok_did = "d".repeat(MAX_ACCOUNT_DID_BYTES);
+    let too_long_did = "d".repeat(MAX_ACCOUNT_DID_BYTES + 1);
+    assert!(!make_avatar_envelope(
+        &corr,
+        "did:plc:account",
+        "asset:1:0:avatar",
+        "did:plc:a",
+        "rev",
+    )
+    .matches_for(&delivery, &too_long_did));
+    assert!(make_avatar_envelope(
+        &corr,
+        &ok_did,
+        "asset:1:0:avatar",
+        "did:plc:a",
+        "rev",
+    )
+    .matches_for(&delivery, &ok_did));
+    {
+        let mut p = post("post", ContentState::Clean);
+        p.author.did = ok_did.clone();
+        let d = make_delivery(corr.clone(), vec![p]);
+        let mut env = make_avatar_envelope(&corr, "did:plc:account", "asset:1:0:avatar", &ok_did, "rev");
+        env.descriptors[0].scope.account_did = ok_did.clone();
+        assert!(env.matches_for(&d, &ok_did));
+        env.descriptors[0].identity = AssetIdentity::Avatar {
+            author_did: ok_did.clone(),
+            source_revision: "r".repeat(MAX_REVISION_URL_BYTES + 1),
+        };
+        assert!(!env.matches_for(&d, &ok_did));
+    }
+    assert!(!make_avatar_envelope(
+        &corr,
+        "did:plc:account",
+        "asset:1:0:avatar",
+        &("d".repeat(MAX_ACCOUNT_DID_BYTES + 1)),
+        "rev",
+    )
+    .matches_for(&delivery, "did:plc:account"));
+    let empty_revision = make_avatar_envelope(
+        &corr,
+        "did:plc:account",
+        "asset:1:0:avatar",
+        "did:plc:a",
+        "",
+    );
+    assert!(!empty_revision.matches_for(&delivery, "did:plc:account"));
+}
+
+#[test]
+fn envelope_rejects_aggregate_bytes_boundary_and_excess() {
+    let corr = correlation(1, 1);
+    let mut posts = Vec::new();
+    for n in 0..10 {
+        posts.push(post(
+            &format!("at://did:plc:a/app.bsky.feed.post/{n}"),
+            ContentState::Clean,
+        ));
+    }
+    let delivery = make_delivery(corr.clone(), posts);
+    let max_aggregate = MAX_AGGREGATE_DESCRIPTOR_BYTES;
+    let mut envelope = NativeFeedEnvelope {
+        correlation: corr.clone(),
+        descriptors: Vec::new(),
+    };
+    let fat_url = "https://cdn.example/".to_string()
+        + &"x".repeat(max_aggregate / 2);
+    envelope.descriptors.push(NativeAssetDescriptor {
+        scope: AccountScope {
+            account_did: "did:plc:account".into(),
+            auth_generation: corr.auth_generation,
+        },
+        identity: AssetIdentity::Avatar {
+            author_did: "did:plc:a".into(),
+            source_revision: fat_url.clone(),
+        },
+        handle: "asset:1:0:avatar".into(),
+        relationship: Relationship::Unknown,
+        following_confirmed: false,
+    });
+    assert!(!envelope.matches_for(&delivery, "did:plc:account"));
+    let small = NativeFeedEnvelope {
+        correlation: corr.clone(),
+        descriptors: vec![NativeAssetDescriptor {
+            scope: AccountScope {
+                account_did: "did:plc:account".into(),
+                auth_generation: corr.auth_generation,
+            },
+            identity: AssetIdentity::Avatar {
+                author_did: "did:plc:a".into(),
+                source_revision: "rev".into(),
+            },
+            handle: "asset:1:0:avatar".into(),
+            relationship: Relationship::Unknown,
+            following_confirmed: false,
+        }],
+    };
+    assert!(small.matches_for(&delivery, "did:plc:account"));
+}
+
+#[test]
+fn envelope_rejects_post_count_beyond_max_history() {
+    let corr = correlation(1, 1);
+    let mut posts: Vec<PostDto> = (0..MAX_HISTORY)
+        .map(|n| {
+            let mut p = post(
+                &format!("at://did:plc:a/app.bsky.feed.post/{n}"),
+                ContentState::Clean,
+            );
+            p.author.did = format!("did:plc:author{n}");
+            p
+        })
+        .collect();
+    posts.push(post(
+        &format!("at://did:plc:a/app.bsky.feed.post/{}", MAX_HISTORY),
+        ContentState::Clean,
+    ));
+    let delivery = make_delivery(corr.clone(), posts);
+    let projected = ProjectedFeed::new(
+        delivery,
+        vec![NativeAssetDescriptor {
+            scope: AccountScope {
+                account_did: "did:plc:account".into(),
+                auth_generation: corr.auth_generation,
+            },
+            identity: AssetIdentity::Avatar {
+                author_did: "did:plc:author0".into(),
+                source_revision: "rev".into(),
+            },
+            handle: "asset:1:0:avatar".into(),
+            relationship: Relationship::Unknown,
+            following_confirmed: false,
+        }],
+    );
+    assert!(!projected.validate_for("did:plc:account"));
 }

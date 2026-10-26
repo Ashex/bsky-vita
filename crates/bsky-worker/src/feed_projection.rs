@@ -3,9 +3,11 @@ use atrium_api::app::bsky::feed::post::RecordData;
 use atrium_api::app::bsky::richtext::facet::MainFeaturesItem;
 use atrium_api::types::{TryFromUnknown, Union};
 use bsky_feed::{
-    AuthorDto, ContentState, ContextMarker, DisplayDecision, FacetRange,
-    FeedCorrelation as PocketCorrelation, FeedDelivery, ImageMetadata, ModerationPolicy, PostDto,
-    MAX_DELIVERY_BYTES, MAX_FIELD_BYTES, SCHEMA_VERSION,
+    AccountScope, AssetIdentity, AuthorDto, ContentState, ContextMarker, DisplayDecision,
+    FacetRange, FeedCorrelation as PocketCorrelation, FeedDelivery, ImageMetadata,
+    ModerationPolicy, NativeAssetDescriptor, PostDto, ProjectedFeed, Relationship,
+    MAX_ACCOUNT_DID_BYTES, MAX_DELIVERY_BYTES, MAX_FIELD_BYTES, MAX_REVISION_URL_BYTES,
+    SCHEMA_VERSION,
 };
 
 pub(crate) fn project_page(
@@ -13,6 +15,15 @@ pub(crate) fn project_page(
     posts: Vec<FeedViewPost>,
     cursor: Option<String>,
 ) -> Result<FeedDelivery, String> {
+    project_page_with_native(correlation, posts, cursor, None).map(|projected| projected.delivery)
+}
+
+pub(crate) fn project_page_with_native(
+    correlation: crate::FeedCorrelation,
+    posts: Vec<FeedViewPost>,
+    cursor: Option<String>,
+    account_did: Option<String>,
+) -> Result<ProjectedFeed, String> {
     let correlation = PocketCorrelation {
         schema: correlation.schema,
         auth_generation: correlation.auth_generation,
@@ -29,8 +40,22 @@ pub(crate) fn project_page(
         return Err("feed cursor exceeds limit".into());
     }
     let policy = ModerationPolicy::default();
+    if posts.len() > bsky_feed::MAX_HISTORY {
+        return Err("post count exceeds maximum".into());
+    }
     let mut projected = Vec::with_capacity(posts.len());
-    for item in &posts {
+    let scope = account_did.map(|account_did| AccountScope {
+        account_did,
+        auth_generation: correlation.auth_generation,
+    });
+    let mut descriptors = Vec::new();
+    let mut descriptor_bytes = 0usize;
+    const DESCRIPTOR_LIMIT: usize = bsky_feed::MAX_HISTORY * 9;
+    const DESCRIPTOR_BYTES_LIMIT: usize = 4 * 1024 * 1024;
+    let scope_did_len = scope
+        .as_ref()
+        .map_or(0, |s| s.account_did.len());
+    for (post_index, item) in posts.iter().enumerate() {
         let mut dto = project_post(&item.post, &policy);
         apply_feed_context(&mut dto, &item.data, &policy);
         if dto.validate().is_err()
@@ -44,6 +69,94 @@ pub(crate) fn project_page(
                 .map_or(true, |bytes| bytes.len() > bsky_feed::MAX_POST_BYTES)
         {
             return Err("bounded placeholder exceeds DTO limits".into());
+        }
+        if dto.state == ContentState::Clean {
+            if let Some(scope) = &scope {
+                let author = &item.post.data.author.data;
+                if let Some(avatar) = &author.avatar {
+                    if avatar.len() > MAX_REVISION_URL_BYTES {
+                        return Err("avatar URL exceeds limit".into());
+                    }
+                    let author_did = author.did.to_string();
+                    if author_did.len() > MAX_ACCOUNT_DID_BYTES {
+                        return Err("author DID exceeds limit".into());
+                    }
+                    let handle =
+                        format!("asset:{}:{}:avatar", correlation.request_id, post_index);
+                    if handle.len() > 256 {
+                        return Err("avatar handle exceeds limit".into());
+                    }
+                    let descriptor_cost = scope_did_len
+                        .saturating_add(handle.len())
+                        .saturating_add(author_did.len())
+                        .saturating_add(avatar.len());
+                    if descriptors.len() < DESCRIPTOR_LIMIT
+                        && descriptor_bytes
+                            .saturating_add(descriptor_cost)
+                            <= DESCRIPTOR_BYTES_LIMIT
+                    {
+                        descriptor_bytes =
+                            descriptor_bytes.saturating_add(descriptor_cost);
+                        descriptors.push(NativeAssetDescriptor {
+                            scope: scope.clone(),
+                            identity: AssetIdentity::Avatar {
+                                author_did,
+                                source_revision: avatar.clone(),
+                            },
+                            handle,
+                            relationship: if author.viewer.as_ref().and_then(|v| v.data.following.as_ref()).is_some() {
+                                Relationship::Followed
+                            } else {
+                                Relationship::Unknown
+                            },
+                            following_confirmed: author.viewer.as_ref().and_then(|v| v.data.following.as_ref()).is_some(),
+                        });
+                    }
+                }
+                let images = post_image_views(item.post.data.embed.as_ref());
+                if !images.is_empty() {
+                    for (index, image) in images.iter().enumerate() {
+                        if image.data.thumb.len() > MAX_REVISION_URL_BYTES
+                            || image.data.fullsize.len() > MAX_REVISION_URL_BYTES
+                        {
+                            break;
+                        }
+                        let handle = format!(
+                            "asset:{}:{}:{}",
+                            correlation.request_id, post_index, index
+                        );
+                        if handle.len() > 256 {
+                            break;
+                        }
+                        let descriptor_cost = scope_did_len
+                            .saturating_add(handle.len())
+                            .saturating_add(image.data.thumb.len())
+                            .saturating_add(image.data.fullsize.len())
+                            .saturating_add(dto.uri.len())
+                            .saturating_add(dto.cid.len());
+                        if descriptors.len() >= DESCRIPTOR_LIMIT
+                            || descriptor_bytes.saturating_add(descriptor_cost)
+                                > DESCRIPTOR_BYTES_LIMIT
+                        {
+                            break;
+                        }
+                        descriptor_bytes = descriptor_bytes.saturating_add(descriptor_cost);
+                        descriptors.push(NativeAssetDescriptor {
+                            scope: scope.clone(),
+                            identity: AssetIdentity::PostImage {
+                                post_uri: dto.uri.clone(),
+                                cid: dto.cid.clone(),
+                                index: index as u32,
+                                thumbnail: image.data.thumb.clone(),
+                                fullsize: image.data.fullsize.clone(),
+                            },
+                            handle,
+                            relationship: Relationship::Unknown,
+                            following_confirmed: false,
+                        });
+                    }
+                }
+            }
         }
         projected.push(dto);
     }
@@ -65,8 +178,27 @@ pub(crate) fn project_page(
         if serialize_size(&delivery)? > MAX_DELIVERY_BYTES {
             return Err("feed delivery exceeds limit".into());
         }
+        descriptors.clear();
     }
-    Ok(delivery)
+    descriptors.retain(|descriptor| match &descriptor.identity {
+        AssetIdentity::Avatar { author_did, .. } => delivery
+            .posts
+            .iter()
+            .any(|post| post.state == ContentState::Clean && post.author.did == *author_did),
+        AssetIdentity::PostImage { post_uri, .. } => delivery
+            .posts
+            .iter()
+            .any(|post| post.uri == *post_uri && post.state == ContentState::Clean),
+    });
+    let projected = ProjectedFeed::new(delivery, descriptors);
+    if let Some(scope) = &scope {
+        if scope.account_did.is_empty()
+            || !projected.validate_for(&scope.account_did)
+        {
+            return Err("projected feed envelope failed validation".into());
+        }
+    }
+    Ok(projected)
 }
 
 fn serialize_size(delivery: &FeedDelivery) -> Result<usize, String> {
@@ -167,7 +299,10 @@ fn project_post(post: &PostView, policy: &ModerationPolicy) -> PostDto {
                         })
                     })
                     .collect();
-                dto.images = data.embed.as_ref().map(project_images).unwrap_or_default();
+                dto.images = post_image_views(data.embed.as_ref())
+                    .iter()
+                    .map(|image| image_metadata(image))
+                    .collect();
             } else {
                 dto.state = ContentState::Unavailable;
             }
@@ -460,10 +595,22 @@ fn author_state(
     }
     Ok(ContentState::Clean)
 }
-fn project_images(embed: &Union<PostViewEmbedRefs>) -> Vec<ImageMetadata> {
+fn post_image_views(
+    embed: Option<&Union<PostViewEmbedRefs>>,
+) -> Vec<&atrium_api::app::bsky::embed::images::ViewImage> {
     match embed {
-        Union::Refs(PostViewEmbedRefs::AppBskyEmbedImagesView(view)) => {
-            view.data.images.iter().map(image_metadata).collect()
+        Some(Union::Refs(PostViewEmbedRefs::AppBskyEmbedImagesView(view))) => {
+            view.data.images.iter().collect()
+        }
+        Some(Union::Refs(PostViewEmbedRefs::AppBskyEmbedRecordWithMediaView(view))) => {
+            match &view.data.media {
+                Union::Refs(
+                    atrium_api::app::bsky::embed::record_with_media::ViewMediaRefs::AppBskyEmbedImagesView(
+                        images,
+                    ),
+                ) => images.data.images.iter().collect(),
+                _ => Vec::new(),
+            }
         }
         _ => Vec::new(),
     }
@@ -487,6 +634,8 @@ fn image_metadata(image: &atrium_api::app::bsky::embed::images::ViewImage) -> Im
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::feed_correlation_preflight;
+    use crate::FeedSource;
     use atrium_api::app::bsky::actor::defs::ProfileViewBasicData;
     use atrium_api::app::bsky::feed::defs::PostViewData;
     use atrium_api::types::{
@@ -546,6 +695,46 @@ mod tests {
             cursor: None,
         }
     }
+
+    fn embedded_post(post: PostView, feed: serde_json::Value) -> FeedViewPost {
+        let mut item = feed;
+        item["post"] = serde_json::to_value(post).unwrap();
+        serde_json::from_value::<atrium_api::app::bsky::feed::defs::FeedViewPostData>(item)
+            .unwrap()
+            .into()
+    }
+
+    fn avatar_sentinel_post(avatar: &str, media: &str, thumb: &str, fullsize: &str) -> PostView {
+        let mut post = typed_post(Some(vec![]), None);
+        post.data.author.data.avatar = Some(avatar.into());
+        let mut value = serde_json::to_value(&post.data).unwrap();
+        value["embed"] = serde_json::json!({
+            "$type":"app.bsky.embed.recordWithMedia#view",
+            "record":{"$type":"app.bsky.embed.record#view","record":{
+                "$type":"app.bsky.embed.record#viewRecord",
+                "uri":"at://did:plc:quoted/app.bsky.feed.post/quoted",
+                "cid":"bafyreiaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "author":{"did":"did:plc:quoted","handle":"quoted.example","displayName":"Quoted","viewer":{},"labels":[]},
+                "indexedAt":"2026-01-01T00:00:00Z",
+                "labels":[],
+                "value":{"$type":"app.bsky.feed.post","text":"QUOTE_BODY_SENTINEL","createdAt":"2026-01-01T00:00:00Z"}
+            }},
+            "media":{"$type":"app.bsky.embed.images#view","images":[
+                {"thumb":thumb,"fullsize":fullsize,"alt":"first"},
+                {"thumb":media,"fullsize":media,"alt":"second"}
+            ]}
+        });
+        value["record"] =
+            serde_json::json!({"text":"visible real post 🛰","createdAt":"2026-01-01T00:00:00Z"});
+        post.data = serde_json::from_value(value).unwrap();
+        post
+    }
+
+    fn guest_delivery_text(post: PostView) -> String {
+        let item = embedded_post(post, serde_json::json!({}));
+        let delivery = project_page(correlation(), vec![item], None).unwrap();
+        serde_json::to_string(&delivery).unwrap()
+    }
     #[test]
     fn typed_reply_and_repost_receive_fixed_context_markers() {
         let post = typed_post(Some(vec![]), None);
@@ -576,6 +765,348 @@ mod tests {
                 .unwrap()
                 .starts_with("visible real post"));
         }
+    }
+
+    fn projected_avatar_relationship(viewer: Option<atrium_api::app::bsky::actor::defs::ViewerState>) -> (Relationship, bool) {
+        let mut post = typed_post(Some(vec![]), viewer);
+        let mut data = serde_json::to_value(&post.data).unwrap();
+        data["author"]["avatar"] = serde_json::json!("https://example.com/avatar.png");
+        post.data = serde_json::from_value(data).unwrap();
+        let feed_item = serde_json::from_value::<atrium_api::app::bsky::feed::defs::FeedViewPostData>(
+            serde_json::json!({"post": post}),
+        )
+        .unwrap();
+        let projected = project_page_with_native(correlation(), vec![feed_item.into()], None, Some("did:plc:viewer".into())).unwrap();
+        let descriptor = projected.native.descriptors.iter().find(|descriptor| matches!(descriptor.identity, AssetIdentity::Avatar { .. })).unwrap();
+        (descriptor.relationship, descriptor.following_confirmed)
+    }
+
+    #[test]
+    fn native_avatar_relationship_requires_confirmed_following() {
+        let following = serde_json::from_value::<atrium_api::app::bsky::actor::defs::ViewerState>(
+            serde_json::json!({"following":"at://did:plc:viewer/app.bsky.graph.follow/abc"}),
+        ).unwrap();
+        assert_eq!(projected_avatar_relationship(Some(following)), (Relationship::Followed, true));
+        assert_eq!(projected_avatar_relationship(None), (Relationship::Unknown, false));
+
+        let viewer_without_following = serde_json::from_value::<atrium_api::app::bsky::actor::defs::ViewerState>(
+            serde_json::json!({"muted":false}),
+        ).unwrap();
+        assert_eq!(projected_avatar_relationship(Some(viewer_without_following)), (Relationship::Unknown, false));
+    }
+
+    #[test]
+    fn record_with_media_projects_descriptors_and_dto_image_metadata_together() {
+        let post = avatar_sentinel_post(
+            "https://cdn.example/AVATAR_SENTINEL.png",
+            "https://cdn.example/MEDIA_SENTINEL_1.png",
+            "https://cdn.example/THUMB_ZERO_SENTINEL.png",
+            "https://cdn.example/FULLSIZE_ZERO_SENTINEL.png",
+        );
+        let item = embedded_post(post, serde_json::json!({}));
+        let projected = project_page_with_native(
+            correlation(),
+            vec![item],
+            None,
+            Some("did:plc:viewer".into()),
+        )
+        .unwrap();
+        assert_eq!(projected.delivery.posts.len(), 1);
+        let dto = &projected.delivery.posts[0];
+        assert_eq!(dto.state, ContentState::Clean);
+        assert_eq!(dto.images.len(), 2, "dto: {dto:?}");
+        assert_eq!(dto.images[0].alt, "first");
+        assert_eq!(dto.images[1].alt, "second");
+        let mut indices = projected
+            .native
+            .descriptors
+            .iter()
+            .filter_map(|descriptor| match &descriptor.identity {
+                AssetIdentity::PostImage { index, .. } => Some(*index),
+                AssetIdentity::Avatar { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        indices.sort_unstable();
+        assert_eq!(indices, vec![0, 1]);
+        let mut revisions = projected
+            .native
+            .descriptors
+            .iter()
+            .filter_map(|descriptor| match &descriptor.identity {
+                AssetIdentity::PostImage { index, thumbnail, fullsize, .. } => {
+                    Some((*index, thumbnail.clone(), fullsize.clone()))
+                }
+                AssetIdentity::Avatar { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        revisions.sort_by_key(|(index, _, _)| *index);
+        assert_eq!(
+            revisions,
+            vec![
+                (
+                    0,
+                    "https://cdn.example/THUMB_ZERO_SENTINEL.png".into(),
+                    "https://cdn.example/FULLSIZE_ZERO_SENTINEL.png".into(),
+                ),
+                (
+                    1,
+                    "https://cdn.example/MEDIA_SENTINEL_1.png".into(),
+                    "https://cdn.example/MEDIA_SENTINEL_1.png".into(),
+                ),
+            ]
+        );
+        assert!(
+            projected
+                .native
+                .descriptors
+                .iter()
+                .any(|descriptor| matches!(&descriptor.identity, AssetIdentity::Avatar { source_revision, .. } if source_revision == "https://cdn.example/AVATAR_SENTINEL.png"))
+        );
+        assert!(projected.validate_for("did:plc:viewer"));
+    }
+
+    #[test]
+    fn hidden_or_blocked_posts_suppress_post_media_assets() {
+        for (labels, viewer) in [
+            (
+                serde_json::json!([{"src":"did:plc:test","uri":"at://did:plc:test/app.bsky.feed.post/abc","val":"!hide","cts":"2026-01-01T00:00:00Z"}]),
+                serde_json::json!({"muted":false}),
+            ),
+            (serde_json::json!([]), serde_json::json!({"blockedBy":true})),
+            (serde_json::json!([]), serde_json::json!({"muted":true})),
+        ] {
+            let mut post = avatar_sentinel_post(
+                "https://cdn.example/AVATAR_SENTINEL.png",
+                "https://cdn.example/MEDIA_SENTINEL_1.png",
+                "https://cdn.example/THUMB_ZERO_SENTINEL.png",
+                "https://cdn.example/FULLSIZE_ZERO_SENTINEL.png",
+            );
+            let mut value = serde_json::to_value(&post.data).unwrap();
+            value["labels"] = labels;
+            value["author"]["viewer"] = viewer;
+            post.data = serde_json::from_value(value).unwrap();
+            let item = embedded_post(post, serde_json::json!({}));
+            let projected = project_page_with_native(
+                correlation(),
+                vec![item],
+                None,
+                Some("did:plc:viewer".into()),
+            )
+            .unwrap();
+            assert_ne!(projected.delivery.posts[0].state, ContentState::Clean);
+            assert!(projected.delivery.posts[0].images.is_empty());
+            assert!(
+                projected.native.descriptors.is_empty(),
+                "state {:?}",
+                projected.delivery.posts[0].state
+            );
+            assert!(projected.validate_for("did:plc:viewer"));
+        }
+    }
+
+    #[test]
+    fn changed_avatar_source_url_produces_a_different_descriptor_identity() {
+        let mut revisions = Vec::new();
+        for avatar in [
+            "https://cdn.example/AVATAR_SENTINEL_FIRST.png",
+            "https://cdn.example/AVATAR_SENTINEL_SECOND.png",
+        ] {
+            let post = avatar_sentinel_post(
+                avatar,
+                "https://cdn.example/MEDIA_SENTINEL_1.png",
+                "https://cdn.example/THUMB_ZERO_SENTINEL.png",
+                "https://cdn.example/FULLSIZE_ZERO_SENTINEL.png",
+            );
+            let item = embedded_post(post, serde_json::json!({}));
+            let projected = project_page_with_native(
+                correlation(),
+                vec![item],
+                None,
+                Some("did:plc:viewer".into()),
+            )
+            .unwrap();
+            let identity = projected
+                .native
+                .descriptors
+                .iter()
+                .find_map(|descriptor| match &descriptor.identity {
+                    AssetIdentity::Avatar { source_revision, author_did } => {
+                        assert_eq!(author_did, "did:plc:test");
+                        Some(source_revision.clone())
+                    }
+                    AssetIdentity::PostImage { .. } => None,
+                })
+                .unwrap();
+            assert_eq!(identity, avatar);
+            revisions.push(identity);
+        }
+        assert_ne!(revisions[0], revisions[1]);
+    }
+
+    #[test]
+    fn serialized_guest_delivery_omits_native_asset_urls() {
+        let post = avatar_sentinel_post(
+            "https://cdn.example/AVATAR_SENTINEL.png",
+            "https://cdn.example/MEDIA_SENTINEL_1.png",
+            "https://cdn.example/THUMB_ZERO_SENTINEL.png",
+            "https://cdn.example/FULLSIZE_ZERO_SENTINEL.png",
+        );
+        let serialized = guest_delivery_text(post);
+        for sentinel in [
+            "AVATAR_SENTINEL",
+            "MEDIA_SENTINEL_1",
+            "THUMB_ZERO_SENTINEL",
+            "FULLSIZE_ZERO_SENTINEL",
+        ] {
+            assert!(
+                !serialized.contains(sentinel),
+                "{sentinel} leaked into guest delivery: {serialized}"
+            );
+        }
+        assert!(serialized.contains("\"alt\":\"first\""));
+        assert!(serialized.contains("\"alt\":\"second\""));
+    }
+
+    #[test]
+    fn feed_preflight_accepts_matching_source_and_cursor() {
+        let mut valid = correlation();
+        valid.source = "following".into();
+        assert!(feed_correlation_preflight(
+            &valid,
+            &FeedSource::Following,
+            None,
+            "did:plc:viewer",
+            valid.request_id,
+        ));
+        valid.cursor = Some("cursor-1".into());
+        assert!(feed_correlation_preflight(
+            &valid,
+            &FeedSource::Following,
+            Some("cursor-1"),
+            "did:plc:viewer",
+            valid.request_id,
+        ));
+    }
+
+    #[test]
+    fn feed_preflight_rejects_wrong_source() {
+        let mut wrong = correlation();
+        wrong.source = "following".into();
+        assert!(!feed_correlation_preflight(
+            &wrong,
+            &FeedSource::Feed("at://did:plc:x/app.bsky.feed.generator/f".into()),
+            None,
+            "did:plc:viewer",
+            wrong.request_id,
+        ));
+    }
+
+    #[test]
+    fn feed_preflight_rejects_wrong_cursor() {
+        let mut wrong = correlation();
+        wrong.source = "following".into();
+        wrong.cursor = Some("cursor-a".into());
+        assert!(!feed_correlation_preflight(
+            &wrong,
+            &FeedSource::Following,
+            Some("cursor-b"),
+            "did:plc:viewer",
+            wrong.request_id,
+        ));
+        wrong.cursor = None;
+        assert!(!feed_correlation_preflight(
+            &wrong,
+            &FeedSource::Following,
+            Some("cursor-b"),
+            "did:plc:viewer",
+            wrong.request_id,
+        ));
+    }
+
+    #[test]
+    fn feed_preflight_rejects_wrong_schema() {
+        let mut wrong = correlation();
+        wrong.source = "following".into();
+        wrong.schema = SCHEMA_VERSION + 1;
+        assert!(wrong.validate().is_err());
+        assert!(!feed_correlation_preflight(
+            &wrong,
+            &FeedSource::Following,
+            None,
+            "did:plc:viewer",
+            wrong.request_id,
+        ));
+    }
+
+    #[test]
+    fn feed_preflight_rejects_zero_auth_generation() {
+        let mut wrong = correlation();
+        wrong.source = "following".into();
+        wrong.auth_generation = 0;
+        assert!(!feed_correlation_preflight(
+            &wrong,
+            &FeedSource::Following,
+            None,
+            "did:plc:viewer",
+            wrong.request_id,
+        ));
+    }
+
+    #[test]
+    fn feed_preflight_rejects_zero_request_id() {
+        let mut wrong = correlation();
+        wrong.source = "following".into();
+        wrong.request_id = 0;
+        assert!(!feed_correlation_preflight(
+            &wrong,
+            &FeedSource::Following,
+            None,
+            "did:plc:viewer",
+            wrong.request_id,
+        ));
+    }
+
+    #[test]
+    fn feed_preflight_rejects_oversized_correlation_fields() {
+        let mut oversized_source = correlation();
+        oversized_source.source = "f".repeat(bsky_feed::MAX_FIELD_BYTES + 1);
+        assert!(!feed_correlation_preflight(
+            &oversized_source,
+            &FeedSource::Following,
+            None,
+            "did:plc:viewer",
+            oversized_source.request_id,
+        ));
+        let mut oversized_cursor = correlation();
+        oversized_cursor.source = "following".into();
+        oversized_cursor.cursor = Some("c".repeat(bsky_feed::MAX_FIELD_BYTES + 1));
+        assert!(!feed_correlation_preflight(
+            &oversized_cursor,
+            &FeedSource::Following,
+            oversized_cursor.cursor.as_deref(),
+            "did:plc:viewer",
+            oversized_cursor.request_id,
+        ));
+    }
+
+    #[test]
+    fn feed_preflight_rejects_absent_account_identity_when_required() {
+        let mut valid = correlation();
+        valid.source = "following".into();
+        assert!(!feed_correlation_preflight(
+            &valid,
+            &FeedSource::Following,
+            None,
+            "",
+            valid.request_id,
+        ));
+        assert!(feed_correlation_preflight(
+            &valid,
+            &FeedSource::Following,
+            None,
+            "",
+            0,
+        ));
     }
 
     #[test]
@@ -735,5 +1266,69 @@ mod tests {
         )
         .unwrap();
         assert!(serde_json::to_vec(&delivery).unwrap().len() <= MAX_DELIVERY_BYTES);
+    }
+
+    #[test]
+    fn native_projection_rejects_posts_exceeding_max_history() {
+        let post = typed_post(Some(vec![]), None);
+        let items: Vec<FeedViewPost> = (0..=bsky_feed::MAX_HISTORY)
+            .map(|_| {
+                embedded_post(post.clone(), serde_json::json!({}))
+            })
+            .collect();
+        let result = project_page_with_native(
+            correlation(),
+            items,
+            None,
+            Some("did:plc:viewer".into()),
+        );
+        assert!(
+            result.is_err(),
+            "projection with {} posts should fail",
+            bsky_feed::MAX_HISTORY + 1
+        );
+    }
+
+    #[test]
+    fn native_projection_allows_exact_max_history() {
+        let post = typed_post(Some(vec![]), None);
+        let items: Vec<FeedViewPost> = (0..bsky_feed::MAX_HISTORY)
+            .map(|_| {
+                embedded_post(post.clone(), serde_json::json!({}))
+            })
+            .collect();
+        let result = project_page_with_native(
+            correlation(),
+            items,
+            None,
+            Some("did:plc:viewer".into()),
+        );
+        assert!(
+            result.is_ok(),
+            "projection with {} posts should succeed",
+            bsky_feed::MAX_HISTORY
+        );
+    }
+
+    #[test]
+    fn avatar_revision_beyond_limit_is_rejected_at_admission() {
+        let post = avatar_sentinel_post(
+            &"x".repeat(MAX_REVISION_URL_BYTES + 1),
+            "https://cdn.example/MEDIA.png",
+            "https://cdn.example/THUMB.png",
+            "https://cdn.example/FULL.png",
+        );
+        let item = embedded_post(post.clone(), serde_json::json!({}));
+        let result = project_page_with_native(
+            correlation(),
+            vec![item],
+            None,
+            Some("did:plc:viewer".into()),
+        );
+        assert!(
+            result.is_err(),
+            "avatar revision exceeding {} bytes should be rejected",
+            MAX_REVISION_URL_BYTES
+        );
     }
 }

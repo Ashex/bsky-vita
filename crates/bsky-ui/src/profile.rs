@@ -1474,7 +1474,7 @@ impl Screen for ProfileScreen {
             WorkResponse::FeedPage { source, batch } => {
                 self.handle_feed_page(source, batch);
             }
-            WorkResponse::FeedPageCorrelated { .. } => {}
+            WorkResponse::FeedPageCorrelated { .. } | WorkResponse::FeedPageProjected { .. } => {}
             // Saved-feeds responses belong to TimelineScreen.
             WorkResponse::SavedFeeds(_) => {}
             // Image responses: cache is updated in main.rs; we just clear

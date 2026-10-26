@@ -1084,7 +1084,7 @@ impl Screen for TimelineScreen {
             }
             // Stale feed page (user switched feeds while in flight). Drop.
             WorkResponse::FeedPage { .. } => {}
-            WorkResponse::FeedPageCorrelated { .. } => {}
+            WorkResponse::FeedPageCorrelated { .. } | WorkResponse::FeedPageProjected { .. } => {}
             // Saved feeds populate the pill row.
             WorkResponse::SavedFeeds(Ok(b)) => {
                 self.pill_buttons.clear();
