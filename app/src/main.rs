@@ -207,6 +207,8 @@ fn main() {
         // Render + collect transition action. The Frame's Drop happens
         // when this block ends, which presents the buffer.
         #[cfg(feature = "pocketjs-poc")]
+        let mut pocket_started_this_frame = false;
+        #[cfg(feature = "pocketjs-poc")]
         if pocket_shell.is_none() && pf.just_pressed(buttons::START) && !ime.is_active() {
             match pocket::PocketShell::new(pocket_coordinator.clone()) {
                 Ok(mut shell) => {
@@ -215,6 +217,7 @@ fn main() {
                     let effects = shell.request_first();
                     pocket_shell = Some(shell);
                     pocket_status = None;
+                    pocket_started_this_frame = true;
                     run_pocket_effects(auth_effects, worker.as_ref(), pocket_shell.as_mut());
                     run_pocket_effects(effects, worker.as_ref(), pocket_shell.as_mut());
                 }
@@ -224,8 +227,16 @@ fn main() {
                 }
             }
         }
+        // The first frame after opening the shell has to boot the guest,
+        // request the first page, and present an initial raster. Give it the
+        // startup budget; subsequent frames use the tighter per-frame budget.
         #[cfg(feature = "pocketjs-poc")]
-        let pocket_frame_deadline = std::time::Instant::now() + bsky_pocket::frame_budget();
+        let pocket_frame_deadline = std::time::Instant::now()
+            + if pocket_started_this_frame {
+                bsky_pocket::startup_budget()
+            } else {
+                bsky_pocket::frame_budget()
+            };
         #[cfg(feature = "pocketjs-poc")]
         let auth_effects = pocket_shell
             .as_mut()
