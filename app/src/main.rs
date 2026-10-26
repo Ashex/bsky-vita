@@ -231,12 +231,13 @@ fn main() {
         // request the first page, and present an initial raster. Give it the
         // startup budget; subsequent frames use the tighter per-frame budget.
         #[cfg(feature = "pocketjs-poc")]
-        let pocket_frame_deadline = std::time::Instant::now()
-            + if pocket_started_this_frame {
-                bsky_pocket::startup_budget()
-            } else {
-                bsky_pocket::frame_budget()
-            };
+        let pocket_budget = if pocket_started_this_frame {
+            bsky_pocket::startup_budget()
+        } else {
+            bsky_pocket::frame_budget()
+        };
+        #[cfg(feature = "pocketjs-poc")]
+        let pocket_frame_deadline = std::time::Instant::now() + pocket_budget;
         #[cfg(feature = "pocketjs-poc")]
         let auth_effects = pocket_shell
             .as_mut()
@@ -260,7 +261,11 @@ fn main() {
                     .lock()
                     .unwrap()
                     .abandon_mount(shell.mount_generation());
-                bsky_log::log!("PocketJS returned to native UI: {e}");
+                bsky_log::log!(
+                    "PocketJS prepare failed: {e} (opening_frame={pocket_started_this_frame}, \
+                     budget_ms={})",
+                    pocket_budget.as_millis()
+                );
                 pocket_status = Some(format!("PocketJS returned to native UI: {e}"));
                 bsky_render::wait_rendering_done();
                 pocket_shell = None;
@@ -302,14 +307,7 @@ fn main() {
             if !pocket_drawing {
                 if let Some(status) = pocket_status.as_deref() {
                     frame.fill_rect(0.0, 0.0, 960.0, 40.0, bsky_render::theme::FIELD_BG);
-                    frame.draw_text(
-                        &font,
-                        12,
-                        28,
-                        bsky_render::theme::TEXT_PRIMARY,
-                        0.9,
-                        status,
-                    );
+                    frame.draw_text(&font, 12, 28, bsky_render::theme::TEXT_PRIMARY, 0.9, status);
                 }
             }
             // Control-hints bar, composited on top of the screen. Drawn

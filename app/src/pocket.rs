@@ -243,12 +243,15 @@ impl PocketShell {
             }));
         self.guest.set_touch_snapshot(touch_snapshot, deadline)?;
         self.guest
-            .eval_global_with_deadline("globalThis.__bskyTouchFrame()", deadline)?;
+            .eval_global_with_deadline("globalThis.__bskyTouchFrame()", deadline)
+            .map_err(|e| format!("touch frame: {e}"))?;
         self.guest
-            .advance_with_deadline(crate::pocket_input::guest_buttons(pad.current), deadline)?;
-        self.native_batch = self.guest.native_batch_with_budget(
-            deadline.saturating_duration_since(std::time::Instant::now()),
-        )?;
+            .advance_with_deadline(crate::pocket_input::guest_buttons(pad.current), deadline)
+            .map_err(|e| format!("advance: {e}"))?;
+        self.native_batch = self
+            .guest
+            .native_batch_with_budget(deadline.saturating_duration_since(std::time::Instant::now()))
+            .map_err(|e| format!("native batch: {e}"))?;
 
         if delivered_feed {
             self.authorized_stamp = None;
@@ -257,7 +260,8 @@ impl PocketShell {
                 .commands
                 .retain(|command| !matches!(command, NativeCommand::Text { stamp: Some(_), .. }));
         }
-        self.run_visible_text(font, deadline)?;
+        self.run_visible_text(font, deadline)
+            .map_err(|e| format!("visible text: {e}"))?;
         self.native_batch.validate(480, 272)?;
         self.authorized_stamp =
             self.native_batch
@@ -296,7 +300,9 @@ impl PocketShell {
             self.native_batch.commands.clear();
             return Err("pocket frame deadline exceeded before presentation".into());
         }
-        self.guest.present_with_deadline(deadline)?;
+        self.guest
+            .present_with_deadline(deadline)
+            .map_err(|e| format!("present: {e}"))?;
         let frame_pixels = self.guest.pixels()?;
         if let Some(old) = self.framebuffer_texture.take() {
             bsky_render::wait_rendering_done();
