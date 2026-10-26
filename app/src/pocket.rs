@@ -1,12 +1,13 @@
 use bsky_input::{buttons, PadFrame, TouchFrame};
 use bsky_pocket::text_batch::pack_lines;
 use bsky_pocket::{EmbeddedGuest, NativeCommand};
-use bsky_render::{Font, Frame, Texture};
+use bsky_render::{Font, Frame, ImageHandleMap, Texture, TextureCache};
 
 pub struct PocketShell {
     coordinator: std::sync::Arc<std::sync::Mutex<bsky_feed::FeedCoordinator>>,
     guest: EmbeddedGuest,
     image_texture: Option<Texture>,
+    image_handles: ImageHandleMap,
     framebuffer_texture: Option<Texture>,
     native_batch: bsky_pocket::NativeBatch,
     authorized_stamp: Option<bsky_pocket::visible_text::Stamp>,
@@ -30,6 +31,7 @@ impl PocketShell {
             coordinator,
             guest: EmbeddedGuest::new(480, 272)?,
             image_texture: None,
+            image_handles: ImageHandleMap::new(bsky_pocket::MAX_NATIVE_IMAGE_HANDLES),
             framebuffer_texture: None,
             native_batch: bsky_pocket::NativeBatch {
                 commands: Vec::new(),
@@ -47,6 +49,9 @@ impl PocketShell {
             pending_delivery: None,
             pending_status: None,
         })
+    }
+    pub fn image_handles_mut(&mut self) -> &mut ImageHandleMap {
+        &mut self.image_handles
     }
     pub fn mount_generation(&self) -> u64 {
         self.mount_generation
@@ -698,7 +703,9 @@ impl PocketShell {
             .filter(|command| {
                 matches!(
                     command,
-                    NativeCommand::Text { stamp: None, .. } | NativeCommand::Image { .. }
+                    NativeCommand::Text { stamp: None, .. }
+                        | NativeCommand::Image { .. }
+                        | NativeCommand::ImageHandle { .. }
                 )
             })
             .cloned()
@@ -716,7 +723,7 @@ impl PocketShell {
                     line,
                     line_height,
                 } => Some((x, y, scale, color, text, stamp, line, line_height)),
-                NativeCommand::Image { .. } => None,
+                NativeCommand::Image { .. } | NativeCommand::ImageHandle { .. } => None,
             })
             .collect();
         let line_height = 18.0;
@@ -739,7 +746,7 @@ impl PocketShell {
     pub fn wants_exit(&self, pad: &PadFrame) -> bool {
         pad.just_pressed(buttons::CIRCLE)
     }
-    pub fn draw(&self, frame: &mut Frame<'_>, font: &Font) {
+    pub fn draw(&self, frame: &mut Frame<'_>, font: &Font, cache: &TextureCache) {
         if let Some(texture) = self.framebuffer_texture.as_ref() {
             frame.draw_pocket_framebuffer(texture);
         }
@@ -772,6 +779,23 @@ impl PocketShell {
                         if let Some(texture) = self.image_texture.as_ref() {
                             frame.draw_texture(texture, *x * 2.0, *y * 2.0);
                         }
+                    }
+                    NativeCommand::ImageHandle {
+                        handle,
+                        x,
+                        y,
+                        width,
+                        height,
+                    } => {
+                        let _ = frame.draw_image_handle(
+                            cache,
+                            &self.image_handles,
+                            *handle,
+                            *x * 2.0,
+                            *y * 2.0,
+                            *width * 2.0,
+                            *height * 2.0,
+                        );
                     }
                     NativeCommand::Image { .. } => {}
                 }

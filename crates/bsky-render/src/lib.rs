@@ -440,7 +440,7 @@ fn qr_to_rgba(s: &str, module_px: u32) -> Result<(Vec<u8>, u32), RenderError> {
                     rgba[off] = 0; // R
                     rgba[off + 1] = 0; // G
                     rgba[off + 2] = 0; // B
-                    // alpha stays at 255
+                                       // alpha stays at 255
                 }
             }
         }
@@ -1322,6 +1322,17 @@ impl TextureCache {
         self.map.contains_key(url)
     }
 
+    /// Resolve a bounded numeric guest handle to its asset key. The mapping
+    /// is intentionally independent of cache population in this slice.
+    pub fn resolve_handle<'a>(
+        &'a self,
+        handles: &'a ImageHandleMap,
+        handle: u32,
+    ) -> Option<&'a Texture> {
+        let key = handles.key(handle)?;
+        self.get(key)
+    }
+
     pub fn get(&self, url: &str) -> Option<&Texture> {
         self.map.get(url)
     }
@@ -1422,6 +1433,32 @@ impl Drop for Render {
 /// sceMsgDialog, etc.) to actually paint onto the back buffer. Calling it
 /// in the wrong slot leaves the dialog active-but-invisible, with input
 /// captured by an unseen keyboard.
+pub struct ImageHandleMap {
+    keys: HashMap<u32, String>,
+    capacity: usize,
+}
+
+impl ImageHandleMap {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            keys: HashMap::with_capacity(capacity),
+            capacity,
+        }
+    }
+
+    pub fn insert(&mut self, handle: u32, key: String) -> bool {
+        if handle == 0 || (!self.keys.contains_key(&handle) && self.keys.len() >= self.capacity) {
+            return false;
+        }
+        self.keys.insert(handle, key);
+        true
+    }
+
+    pub fn key(&self, handle: u32) -> Option<&str> {
+        self.keys.get(&handle).map(String::as_str)
+    }
+}
+
 pub struct Frame<'r> {
     /// Have we already called `vita2d_end_drawing` (via `pump_ime`)?
     /// Drop checks this to avoid a double-end. Only used on the Vita
@@ -1741,6 +1778,26 @@ impl<'r> Frame<'r> {
     }
 
     /// Draw `tex` scaled by `(x_scale, y_scale)` with top-left at `(x, y).
+    /// Resolve a guest image handle and draw it into an explicit pixel rectangle.
+    pub fn draw_image_handle(
+        &mut self,
+        cache: &TextureCache,
+        handles: &ImageHandleMap,
+        handle: u32,
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+    ) -> bool {
+        let Some(texture) = cache.resolve_handle(handles, handle) else {
+            return false;
+        };
+        let x_scale = width / texture.width() as f32;
+        let y_scale = height / texture.height() as f32;
+        self.draw_texture_scale(texture, x, y, x_scale, y_scale);
+        true
+    }
+
     pub fn draw_texture_scale(
         &mut self,
         tex: &Texture,
@@ -2225,6 +2282,21 @@ mod tests {
         // RGBA8(r,g,b,a) = (a<<24) | (b<<16) | (g<<8) | r — host check.
         let c = Color::rgba(0x12, 0x34, 0x56, 0x78);
         assert_eq!(c.raw(), 0x78_56_34_12);
+    }
+
+    #[test]
+    fn image_handle_map_is_bounded_and_resolution_distinguishes_missing_or_evicted_assets() {
+        let mut handles = ImageHandleMap::new(2);
+        assert!(handles.insert(1, "present".into()));
+        assert!(handles.insert(2, "evicted".into()));
+        assert!(!handles.insert(3, "overflow".into()));
+        assert_eq!(handles.key(1), Some("present"));
+        assert_eq!(handles.key(9), None);
+        assert_eq!(handles.key(2), Some("evicted"));
+        let cache = TextureCache::new(0);
+        assert!(cache.resolve_handle(&handles, 1).is_none());
+        assert!(cache.resolve_handle(&handles, 9).is_none());
+        assert!(cache.resolve_handle(&handles, 2).is_none());
     }
 
     #[test]

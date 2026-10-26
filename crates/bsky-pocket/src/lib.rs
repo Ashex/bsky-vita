@@ -23,6 +23,7 @@ pub const MAX_NATIVE_COMMANDS: usize = 8;
 pub const MAX_NATIVE_COMMAND_BYTES: usize = 4 * 1024;
 pub const MAX_NATIVE_TEXT_BYTES: usize = 1024;
 pub const MAX_NATIVE_IMAGE_SIDE: u32 = 64;
+pub const MAX_NATIVE_IMAGE_HANDLES: usize = 8;
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
@@ -41,6 +42,13 @@ pub enum NativeCommand {
         generation: u32,
         x: f32,
         y: f32,
+    },
+    ImageHandle {
+        handle: u32,
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
     },
 }
 
@@ -63,7 +71,7 @@ impl NativeCommand {
     pub fn encoded_size(&self) -> usize {
         match self {
             NativeCommand::Text { text, .. } => 64 + text.len(),
-            NativeCommand::Image { .. } => 64,
+            NativeCommand::Image { .. } | NativeCommand::ImageHandle { .. } => 64,
         }
     }
 }
@@ -92,6 +100,7 @@ impl NativeBatch {
             return Err("native command count exceeds limit".into());
         }
         let mut bytes = 0usize;
+        let mut image_handles = std::collections::HashSet::new();
         for command in &self.commands {
             match command {
                 NativeCommand::Text {
@@ -114,6 +123,34 @@ impl NativeBatch {
                     bytes = bytes
                         .checked_add(48 + text.len())
                         .ok_or("native batch size overflow")?;
+                }
+                NativeCommand::ImageHandle {
+                    handle,
+                    x,
+                    y,
+                    width,
+                    height,
+                } => {
+                    if !x.is_finite()
+                        || !y.is_finite()
+                        || !width.is_finite()
+                        || !height.is_finite()
+                        || *x < 0.0
+                        || *y < 0.0
+                        || *x >= viewport_width as f32
+                        || *y >= viewport_height as f32
+                        || *width <= 0.0
+                        || *height <= 0.0
+                        || *x + *width > viewport_width as f32
+                        || *y + *height > viewport_height as f32
+                    {
+                        return Err("invalid native image-handle command".into());
+                    }
+                    image_handles.insert(*handle);
+                    if image_handles.len() > MAX_NATIVE_IMAGE_HANDLES {
+                        return Err("native image handle count exceeds limit".into());
+                    }
+                    bytes = bytes.checked_add(20).ok_or("native batch size overflow")?;
                 }
                 NativeCommand::Image { generation, x, y } => {
                     if !x.is_finite()
@@ -175,8 +212,8 @@ fn configured_budget_value(value: Option<&str>, default: Duration) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_NATIVE_COMMAND_BYTES, MAX_NATIVE_COMMANDS, MAX_NATIVE_TEXT_BYTES, NativeBatch,
-        NativeCommand, NativeImage, configured_budget_value,
+        configured_budget_value, NativeBatch, NativeCommand, NativeImage, MAX_NATIVE_COMMANDS,
+        MAX_NATIVE_COMMAND_BYTES, MAX_NATIVE_TEXT_BYTES,
     };
     use std::time::Duration;
 
@@ -281,6 +318,57 @@ mod tests {
                     stamp: None,
                     line: 0,
                     line_height: 18,
+                })
+                .collect(),
+            image: None,
+        };
+        assert!(too_many.validate(480, 272).is_err());
+    }
+
+    #[test]
+    fn image_handle_commands_roundtrip_and_enforce_viewport_and_distinct_handle_limit() {
+        let command = NativeCommand::ImageHandle {
+            handle: 7,
+            x: 2.0,
+            y: 3.0,
+            width: 20.0,
+            height: 18.0,
+        };
+        assert_eq!(command.encoded_size(), 64);
+        let batch = NativeBatch {
+            commands: vec![command],
+            image: None,
+        };
+        assert_eq!(
+            NativeBatch::from_json(&batch.to_json().unwrap(), 480, 272).unwrap(),
+            batch
+        );
+        for (x, y, width, height) in [
+            (f32::NAN, 0.0, 1.0, 1.0),
+            (0.0, 0.0, 0.0, 1.0),
+            (479.0, 0.0, 2.0, 1.0),
+            (0.0, 271.0, 1.0, 2.0),
+        ] {
+            let invalid = NativeBatch {
+                commands: vec![NativeCommand::ImageHandle {
+                    handle: 1,
+                    x,
+                    y,
+                    width,
+                    height,
+                }],
+                image: None,
+            };
+            assert!(invalid.validate(480, 272).is_err());
+        }
+        let too_many = NativeBatch {
+            commands: (0..=8)
+                .map(|handle| NativeCommand::ImageHandle {
+                    handle: handle as u32 + 1,
+                    x: handle as f32,
+                    y: 0.0,
+                    width: 1.0,
+                    height: 1.0,
                 })
                 .collect(),
             image: None,

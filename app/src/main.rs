@@ -251,10 +251,11 @@ fn main() {
             let mut frame = render.begin_frame();
             #[cfg(feature = "pocketjs-poc")]
             let action = if pocket_drawing {
-                pocket_shell
-                    .as_ref()
-                    .expect("active PocketJS shell")
-                    .draw(&mut frame, &font);
+                pocket_shell.as_ref().expect("active PocketJS shell").draw(
+                    &mut frame,
+                    &font,
+                    &texture_cache,
+                );
                 ScreenAction::None
             } else {
                 top.frame(&mut frame, &font, &ctx, &mut ime)
