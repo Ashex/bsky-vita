@@ -37,14 +37,15 @@ visible post URIs before restoring disk bytes, submitting missing/stale assets,
 and binding native avatar draw slots. Earlier integration findings below are
 historical, not a description of the repaired source.
 
-**The icon atlas is STAGED, not integrated.** `app/static/pocket_icons.png` and
-`crates/bsky-render/src/pocket_icon_table.rs` still have no presentation consumer.
-They are not evidence of rendered icons. D8's real consumer remains deferred:
-introducing atlas texture ownership, source-rectangle draws, and guest/native
-placement without device rendering validation is outside this repair's verified
-presentation path. A follow-up must wire those together and verify on a Vita.
-No device rendering, masking, filesystem semantics, or performance is verified
-by the host tests or VPK build.
+**The icon atlas is now wired into the control-hints bar.** `IconAtlas` in
+`crates/bsky-render` loads `app0:pocket_icons.png`, resolves cells through the
+generated `pocket_icon_table`, and draws a glyph before a hint whose button maps
+to a bundled icon; unmapped buttons keep their text label, and a missing atlas
+falls back to text. The mapping and atlas table are covered by host tests. What
+remains unverified is only the on-device appearance: glyph legibility at the
+16px draw size, atlas decode on the console, and placement within the bar. No
+device rendering, masking, filesystem semantics, or performance is verified by
+the host tests or VPK build.
 
 ## Historical integration findings (before acceptance repair)
 

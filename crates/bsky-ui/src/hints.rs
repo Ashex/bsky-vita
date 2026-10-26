@@ -7,7 +7,7 @@
 //! ticks it each frame, and draws it on top of the active screen using
 //! that screen's [`crate::screen::Screen::control_hints`].
 
-use bsky_render::{theme, Font, Frame, SCREEN_HEIGHT, SCREEN_WIDTH};
+use bsky_render::{theme, Font, Frame, IconAtlas, SCREEN_HEIGHT, SCREEN_WIDTH};
 
 use crate::tabbar::TAB_BAR_HEIGHT;
 
@@ -70,6 +70,20 @@ impl HintOverlay {
         hints: &[(&'static str, &'static str)],
         has_tab_bar: bool,
     ) {
+        self.draw_with_icons(frame, font, hints, has_tab_bar, None);
+    }
+
+    /// Same as [`draw`](Self::draw), but draws an icon glyph before a hint
+    /// whose button maps to a bundled icon. Falls back to the text label
+    /// when the atlas is absent or the button has no icon.
+    pub fn draw_with_icons(
+        &self,
+        frame: &mut Frame,
+        font: &Font,
+        hints: &[(&'static str, &'static str)],
+        has_tab_bar: bool,
+        icons: Option<&IconAtlas>,
+    ) {
         if !self.visible() || hints.is_empty() {
             return;
         }
@@ -96,6 +110,8 @@ impl HintOverlay {
 
         let scale = 0.8;
         let baseline = bar_y + HINT_BAR_H - 8;
+        let icon_size = 16.0;
+        let icon_y = (bar_y + (HINT_BAR_H - icon_size as i32) / 2) as f32;
         let mut cx = 12;
         for (i, (button, action)) in hints.iter().enumerate() {
             if i > 0 {
@@ -103,11 +119,58 @@ impl HintOverlay {
                 frame.draw_text(font, cx, baseline, theme::TEXT_MUTED, scale, "·");
                 cx += frame.measure_text(font, scale, "·").0 + 8;
             }
+            let icon = icons.and_then(|atlas| {
+                icon_for_button(button)
+                    .filter(|name| atlas.draw(frame, name, cx as f32, icon_y, icon_size))
+                    .map(|_| ())
+            });
+            if icon.is_some() {
+                cx += icon_size as i32 + 4;
+            }
             // Button in accent, action in primary — quick to scan.
             frame.draw_text(font, cx, baseline, theme::ACCENT, scale, button);
             cx += frame.measure_text(font, scale, button).0 + 4;
             frame.draw_text(font, cx, baseline, theme::TEXT_PRIMARY, scale, action);
             cx += frame.measure_text(font, scale, action).0;
         }
+    }
+}
+
+/// Map a hint button label to a bundled icon name, when one exists.
+fn icon_for_button(button: &str) -> Option<&'static str> {
+    match button {
+        "CIRCLE" => Some("back"),
+        "TRIANGLE" => Some("refresh"),
+        "L1" => Some("next"),
+        "R1" => Some("close"),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mapped_buttons_resolve_to_bundled_icon_names() {
+        for (button, expected) in [
+            ("CIRCLE", "back"),
+            ("TRIANGLE", "refresh"),
+            ("L1", "next"),
+            ("R1", "close"),
+        ] {
+            let name = icon_for_button(button).expect("mapped button has an icon");
+            assert_eq!(name, expected);
+            assert!(
+                bsky_render::pocket_icon_table::pocket_icon_index(name).is_some(),
+                "icon {name} for {button} must exist in the atlas table"
+            );
+        }
+    }
+
+    #[test]
+    fn unmapped_buttons_have_no_icon() {
+        assert!(icon_for_button("SQUARE").is_none());
+        assert!(icon_for_button("START").is_none());
     }
 }

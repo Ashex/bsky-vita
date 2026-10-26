@@ -35,7 +35,7 @@ mod pocket_media;
 
 use bsky_auth::AuthClient;
 use bsky_input::{buttons, Pad, Touch};
-use bsky_render::{EmojiAtlas, Render, Texture, TextureCache};
+use bsky_render::{EmojiAtlas, IconAtlas, Render, Texture, TextureCache};
 use bsky_ui::{
     ConversationListScreen, HintOverlay, LoginScreen, NotificationsScreen, ProfileScreen, Screen,
     ScreenAction, SearchScreen, TimelineScreen, TopLevel, UiCtx,
@@ -141,6 +141,14 @@ fn main() {
                 None
             }
         };
+
+    let icon_atlas: Option<IconAtlas> = match IconAtlas::load("app0:pocket_icons.png") {
+        Ok(a) => Some(a),
+        Err(e) => {
+            eprintln!("icon atlas load failed ({e}); control hints will use text labels");
+            None
+        }
+    };
 
     let mut pad = Pad::init();
     let touch = Touch::init();
@@ -277,7 +285,13 @@ fn main() {
             }
             if !ime.is_active() && !cfg!(feature = "pocketjs-poc") {
                 let hint_list = top.control_hints();
-                hints.draw(&mut frame, &font, &hint_list, top.top_level().is_some());
+                hints.draw_with_icons(
+                    &mut frame,
+                    &font,
+                    &hint_list,
+                    top.top_level().is_some(),
+                    icon_atlas.as_ref(),
+                );
             }
             if ime.is_active() {
                 frame.pump_ime();

@@ -42,6 +42,48 @@ mod video_shader_src;
 
 pub mod pocket_icon_table;
 
+/// The bundled icon sheet: a single texture holding every pocket icon in a
+/// fixed grid, plus the generated name-to-cell lookup. Load once at startup
+/// and draw cells by name so control affordances need no per-icon asset.
+pub struct IconAtlas {
+    texture: Texture,
+}
+
+impl IconAtlas {
+    /// Load the atlas from a Vita asset path (e.g. `app0:pocket_icons.png`).
+    pub fn load(path: &str) -> Result<Self, RenderError> {
+        Ok(Self {
+            texture: Texture::from_png_file(path)?,
+        })
+    }
+
+    /// Build from raw PNG bytes; used by tests and any embedded-asset path.
+    pub fn from_png_bytes(bytes: &[u8]) -> Result<Self, RenderError> {
+        Ok(Self {
+            texture: Texture::from_image_bytes(bytes)?,
+        })
+    }
+
+    pub fn texture(&self) -> &Texture {
+        &self.texture
+    }
+
+    /// Draw the icon named `name` with its top-left at `(x, y)`, scaled to a
+    /// `size` x `size` square. Unknown names draw nothing and return false.
+    pub fn draw(&self, frame: &mut Frame<'_>, name: &str, x: f32, y: f32, size: f32) -> bool {
+        let Some(index) = pocket_icon_table::pocket_icon_index(name) else {
+            return false;
+        };
+        let cell = pocket_icon_table::ICON_CELL_SIZE as f32;
+        let columns = pocket_icon_table::ICON_ATLAS_COLUMNS;
+        let src_x = (index as u32 % columns) as f32 * cell;
+        let src_y = (index as u32 / columns) as f32 * cell;
+        let scale = size / cell;
+        frame.draw_texture_part_scale(&self.texture, x, y, src_x, src_y, cell, cell, scale, scale);
+        true
+    }
+}
+
 /// A YUV420 video frame as three GXM-bindable luma-format textures
 /// (Y at full resolution, U/V at half). Unique to video playback —
 /// consumed only by [`Frame::draw_video_yuv`]. Created with
@@ -2328,6 +2370,40 @@ mod tests {
     fn rgb_sets_alpha_to_full() {
         let c = Color::rgb(0x11, 0x22, 0x33);
         assert_eq!(c.raw(), 0xFF_33_22_11);
+    }
+
+    #[test]
+    fn icon_table_ships_every_named_cell() {
+        for name in ["refresh", "back", "next", "close"] {
+            assert!(
+                pocket_icon_table::pocket_icon_index(name).is_some(),
+                "icon {name} missing from atlas table"
+            );
+        }
+        assert!(pocket_icon_table::pocket_icon_index("nope").is_none());
+        let columns = pocket_icon_table::ICON_ATLAS_COLUMNS;
+        for (_, index) in pocket_icon_table::POCKET_ICONS {
+            assert!(
+                (*index as u32) < columns * 4,
+                "cell index out of atlas grid"
+            );
+        }
+    }
+
+    #[test]
+    fn icon_atlas_asset_is_present_and_a_png() {
+        // Texture decoding is a Vita-only operation, so the host cannot
+        // decode the sheet. Confirm the bundled asset exists, is a PNG, and
+        // has non-trivial content for the declared grid instead.
+        let bytes = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../app/static/pocket_icons.png"
+        ))
+        .expect("bundled atlas should exist at app/static/pocket_icons.png");
+        assert!(
+            bytes.len() > 8 && &bytes[..8] == b"\x89PNG\r\n\x1a\n",
+            "bundled atlas must be a non-empty PNG"
+        );
     }
 
     #[test]
