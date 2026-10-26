@@ -80,6 +80,8 @@ fn run_pocket_effects(
 
 fn main() {
     bsky_log::init("ux0:/data/BSKY00001/run.log");
+    #[cfg(feature = "pocketjs-poc")]
+    bsky_log::log!("pocketjs-poc feature build active (START opens the PocketJS shell)");
     // Grant access to the OS photo gallery (ux0:picture/ albums) — without
     // this the sandbox hides CAMERA/SCREENSHOT/etc. Uses a 'static
     // mount-point string (the mount retains the pointer).
@@ -176,6 +178,8 @@ fn main() {
     #[cfg(feature = "pocketjs-poc")]
     let mut pocket_shell: Option<pocket::PocketShell> = None;
     #[cfg(feature = "pocketjs-poc")]
+    let mut pocket_status: Option<String> = None;
+    #[cfg(feature = "pocketjs-poc")]
     let mut pocket_media = bsky_worker::media_registry::PocketMediaRegistry::new();
     #[cfg(feature = "pocketjs-poc")]
     let media_disk_cache =
@@ -210,10 +214,14 @@ fn main() {
                     shell.open_mount();
                     let effects = shell.request_first();
                     pocket_shell = Some(shell);
+                    pocket_status = None;
                     run_pocket_effects(auth_effects, worker.as_ref(), pocket_shell.as_mut());
                     run_pocket_effects(effects, worker.as_ref(), pocket_shell.as_mut());
                 }
-                Err(e) => bsky_log::log!("PocketJS startup failed: {e}"),
+                Err(e) => {
+                    bsky_log::log!("PocketJS startup failed: {e}");
+                    pocket_status = Some(format!("PocketJS startup failed: {e}"));
+                }
             }
         }
         #[cfg(feature = "pocketjs-poc")]
@@ -242,6 +250,7 @@ fn main() {
                     .unwrap()
                     .abandon_mount(shell.mount_generation());
                 bsky_log::log!("PocketJS returned to native UI: {e}");
+                pocket_status = Some(format!("PocketJS returned to native UI: {e}"));
                 bsky_render::wait_rendering_done();
                 pocket_shell = None;
             }
@@ -276,6 +285,22 @@ fn main() {
             };
             #[cfg(not(feature = "pocketjs-poc"))]
             let action = top.frame(&mut frame, &font, &ctx, &mut ime);
+            // Surface a PocketJS startup failure on screen; otherwise it is
+            // only visible in run.log and START looks like a dead button.
+            #[cfg(feature = "pocketjs-poc")]
+            if !pocket_drawing {
+                if let Some(status) = pocket_status.as_deref() {
+                    frame.fill_rect(0.0, 0.0, 960.0, 40.0, bsky_render::theme::FIELD_BG);
+                    frame.draw_text(
+                        &font,
+                        12,
+                        28,
+                        bsky_render::theme::TEXT_PRIMARY,
+                        0.9,
+                        status,
+                    );
+                }
+            }
             // Control-hints bar, composited on top of the screen. Drawn
             // before pump_ime (which ends frame drawing) and skipped while
             // the IME is up (the keyboard covers the screen anyway).
