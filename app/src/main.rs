@@ -30,6 +30,9 @@ mod pocket;
 #[cfg(feature = "pocketjs-poc")]
 mod pocket_input;
 
+#[cfg(feature = "pocketjs-poc")]
+mod pocket_media;
+
 use bsky_auth::AuthClient;
 use bsky_input::{buttons, Pad, Touch};
 use bsky_render::{EmojiAtlas, Render, Texture, TextureCache};
@@ -166,6 +169,9 @@ fn main() {
     let mut pocket_shell: Option<pocket::PocketShell> = None;
     #[cfg(feature = "pocketjs-poc")]
     let mut pocket_media = bsky_worker::media_registry::PocketMediaRegistry::new();
+    #[cfg(feature = "pocketjs-poc")]
+    let media_disk_cache =
+        bsky_media::asset_cache::AssetCache::new(format!("{}/media-cache", bsky_auth::DATA_DIR));
     #[cfg(feature = "pocketjs-poc")]
     let pocket_coordinator =
         std::sync::Arc::new(std::sync::Mutex::new(bsky_feed::FeedCoordinator::default()));
@@ -399,7 +405,16 @@ fn main() {
         }
 
         #[cfg(feature = "pocketjs-poc")]
-        drop(pocket_media.drain());
+        if let Some(shell) = pocket_shell.as_mut() {
+            let visible: Vec<String> = shell.visible_uris().to_vec();
+            pocket_media::service(
+                &pocket_media,
+                &mut texture_cache,
+                &media_disk_cache,
+                shell.image_handles_mut(),
+                &visible,
+            );
+        }
 
         // An auth failure from this frame's session must win over an
         // AuthComplete action produced by the same presentation.

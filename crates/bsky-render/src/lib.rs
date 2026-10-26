@@ -1466,6 +1466,12 @@ impl ImageHandleMap {
     pub fn key(&self, handle: u32) -> Option<&str> {
         self.keys.get(&handle).map(String::as_str)
     }
+
+    /// Drop every handle binding. Called each frame before rebinding the
+    /// visible rows so stale handles never resolve to the wrong image.
+    pub fn clear(&mut self) {
+        self.keys.clear();
+    }
 }
 
 pub struct Frame<'r> {

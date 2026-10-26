@@ -21,6 +21,7 @@ pub struct PocketShell {
     measured_widths: std::collections::HashMap<(String, u64), u16>,
     pending_delivery: Option<bsky_feed::FeedDelivery>,
     pending_status: Option<String>,
+    visible_uris: Vec<String>,
 }
 
 impl PocketShell {
@@ -48,7 +49,13 @@ impl PocketShell {
             measured_widths: std::collections::HashMap::new(),
             pending_delivery: None,
             pending_status: None,
+            visible_uris: Vec::new(),
         })
+    }
+
+    /// The URIs of the rows currently laid out in the viewport, in order.
+    pub fn visible_uris(&self) -> &[String] {
+        &self.visible_uris
     }
     pub fn image_handles_mut(&mut self) -> &mut ImageHandleMap {
         &mut self.image_handles
@@ -360,6 +367,7 @@ impl PocketShell {
                     .map(|layout| layout.rows.into_iter().map(|row| row.uri).collect())
                     .unwrap_or_default()
             });
+            self.visible_uris = requested.clone();
             self.measurement_queue.retain(|uri| requested.contains(uri));
             for uri in requested {
                 if !self.measurement_queue.contains(&uri) {
