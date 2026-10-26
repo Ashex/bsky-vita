@@ -247,6 +247,8 @@ name = "bsky-media"
 version = "1.0.0"
 dependencies = [
  "bsky-log",
+ "bsky-worker",
+ "tempfile",
  "vitasdk-sys",
 ]
 
