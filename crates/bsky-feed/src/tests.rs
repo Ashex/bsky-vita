@@ -95,6 +95,15 @@ fn native_media_contract_is_non_serializable_scope_bound_and_distinct_from_guest
         correlation: delivery.correlation.clone(),
         descriptors: vec![matching_descriptor],
     };
+    let mut delivery = delivery;
+    delivery.posts[0].cid = "cid1".into();
+    // Both slots exist: reject aliasing slot 1 to identity index 0.
+    let second_image = delivery.posts[0].images[0].clone();
+    delivery.posts[0].images.push(second_image);
+    assert!(envelope.matches_for(&delivery, "did:plc:account"));
+    let mut wrong_suffix = envelope.clone();
+    wrong_suffix.descriptors[0].handle = "asset:1:0:1".into();
+    assert!(!wrong_suffix.matches_for(&delivery, "did:plc:account"));
     let mut image_delivery = delivery.clone();
     image_delivery.posts[0].images.clear();
     assert!(!envelope.matches_for(&image_delivery, "did:plc:account"));
@@ -549,10 +558,7 @@ fn history_caps_count_before_accepting_more_than_two_hundred_rows() {
     assert_eq!(history.posts().back().unwrap().uri, "latest");
 }
 
-fn make_delivery(
-    correlation: FeedCorrelation,
-    posts: Vec<PostDto>,
-) -> FeedDelivery {
+fn make_delivery(correlation: FeedCorrelation, posts: Vec<PostDto>) -> FeedDelivery {
     FeedDelivery {
         schema: SCHEMA_VERSION,
         correlation,
@@ -620,7 +626,10 @@ fn envelope_rejects_wrong_account_did_and_invalid_scope_yields_zero_descriptors(
     let corr = correlation(1, 1);
     let delivery = make_delivery(
         corr.clone(),
-        vec![post("at://did:plc:a/app.bsky.feed.post/0", ContentState::Clean)],
+        vec![post(
+            "at://did:plc:a/app.bsky.feed.post/0",
+            ContentState::Clean,
+        )],
     );
     let envelope = make_avatar_envelope(
         &corr,
@@ -659,7 +668,10 @@ fn envelope_rejects_image_uri_match_with_wrong_cid() {
     let corr = correlation(1, 1);
     let delivery = make_delivery(
         corr.clone(),
-        vec![post("at://did:plc:a/app.bsky.feed.post/0", ContentState::Clean)],
+        vec![post(
+            "at://did:plc:a/app.bsky.feed.post/0",
+            ContentState::Clean,
+        )],
     );
     let envelope = make_image_envelope(
         &corr,
@@ -677,7 +689,10 @@ fn envelope_rejects_image_with_wrong_index() {
     let corr = correlation(1, 1);
     let delivery = make_delivery(
         corr.clone(),
-        vec![post("at://did:plc:a/app.bsky.feed.post/0", ContentState::Clean)],
+        vec![post(
+            "at://did:plc:a/app.bsky.feed.post/0",
+            ContentState::Clean,
+        )],
     );
     let envelope = make_image_envelope(
         &corr,
@@ -728,7 +743,10 @@ fn envelope_rejects_malformed_handle() {
     let corr = correlation(1, 1);
     let delivery = make_delivery(
         corr.clone(),
-        vec![post("at://did:plc:a/app.bsky.feed.post/0", ContentState::Clean)],
+        vec![post(
+            "at://did:plc:a/app.bsky.feed.post/0",
+            ContentState::Clean,
+        )],
     );
     for bad_handle in [
         "",
@@ -742,13 +760,8 @@ fn envelope_rejects_malformed_handle() {
         "native:1:0",
         "asset:1:-1:avatar",
     ] {
-        let envelope = make_avatar_envelope(
-            &corr,
-            "did:plc:account",
-            bad_handle,
-            "did:plc:a",
-            "rev",
-        );
+        let envelope =
+            make_avatar_envelope(&corr, "did:plc:account", bad_handle, "did:plc:a", "rev");
         assert!(
             !envelope.matches_for(&delivery, "did:plc:account"),
             "handle '{bad_handle}' should be rejected"
@@ -822,7 +835,10 @@ fn envelope_rejects_field_length_boundary_and_excess() {
     let corr = correlation(1, 1);
     let delivery = make_delivery(
         corr.clone(),
-        vec![post("at://did:plc:a/app.bsky.feed.post/0", ContentState::Clean)],
+        vec![post(
+            "at://did:plc:a/app.bsky.feed.post/0",
+            ContentState::Clean,
+        )],
     );
     let ok_did = "d".repeat(MAX_ACCOUNT_DID_BYTES);
     let too_long_did = "d".repeat(MAX_ACCOUNT_DID_BYTES + 1);
@@ -834,19 +850,16 @@ fn envelope_rejects_field_length_boundary_and_excess() {
         "rev",
     )
     .matches_for(&delivery, &too_long_did));
-    assert!(make_avatar_envelope(
-        &corr,
-        &ok_did,
-        "asset:1:0:avatar",
-        "did:plc:a",
-        "rev",
-    )
-    .matches_for(&delivery, &ok_did));
+    assert!(
+        make_avatar_envelope(&corr, &ok_did, "asset:1:0:avatar", "did:plc:a", "rev",)
+            .matches_for(&delivery, &ok_did)
+    );
     {
         let mut p = post("post", ContentState::Clean);
         p.author.did = ok_did.clone();
         let d = make_delivery(corr.clone(), vec![p]);
-        let mut env = make_avatar_envelope(&corr, "did:plc:account", "asset:1:0:avatar", &ok_did, "rev");
+        let mut env =
+            make_avatar_envelope(&corr, "did:plc:account", "asset:1:0:avatar", &ok_did, "rev");
         env.descriptors[0].scope.account_did = ok_did.clone();
         assert!(env.matches_for(&d, &ok_did));
         env.descriptors[0].identity = AssetIdentity::Avatar {
@@ -889,8 +902,7 @@ fn envelope_rejects_aggregate_bytes_boundary_and_excess() {
         correlation: corr.clone(),
         descriptors: Vec::new(),
     };
-    let fat_url = "https://cdn.example/".to_string()
-        + &"x".repeat(max_aggregate / 2);
+    let fat_url = "https://cdn.example/".to_string() + &"x".repeat(max_aggregate / 2);
     envelope.descriptors.push(NativeAssetDescriptor {
         scope: AccountScope {
             account_did: "did:plc:account".into(),

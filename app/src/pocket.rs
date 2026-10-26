@@ -22,6 +22,8 @@ pub struct PocketShell {
     pending_delivery: Option<bsky_feed::FeedDelivery>,
     pending_status: Option<String>,
     visible_uris: Vec<String>,
+    avatar_slots: Vec<(u32, String)>,
+    avatar_positions: std::collections::HashMap<String, (f32, f32)>,
 }
 
 impl PocketShell {
@@ -50,12 +52,33 @@ impl PocketShell {
             pending_delivery: None,
             pending_status: None,
             visible_uris: Vec::new(),
+            avatar_slots: Vec::new(),
+            avatar_positions: std::collections::HashMap::new(),
         })
     }
 
     /// The URIs of the rows currently laid out in the viewport, in order.
     pub fn visible_uris(&self) -> &[String] {
         &self.visible_uris
+    }
+    pub fn bind_avatar_slots(
+        &mut self,
+        registry: &bsky_worker::media_registry::PocketMediaRegistry,
+    ) {
+        self.avatar_slots = registry
+            .visible_handles(&self.visible_uris, bsky_pocket::MAX_NATIVE_IMAGE_HANDLES)
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, handle)| {
+                let descriptor = registry.descriptor(handle)?;
+                matches!(descriptor.identity, bsky_feed::AssetIdentity::Avatar { .. }).then(|| {
+                    (
+                        slot as u32 + 1,
+                        registry.post_for_handle(handle).unwrap().to_owned(),
+                    )
+                })
+            })
+            .collect();
     }
     pub fn image_handles_mut(&mut self) -> &mut ImageHandleMap {
         &mut self.image_handles
@@ -69,6 +92,8 @@ impl PocketShell {
     }
     fn reset_local(&mut self) {
         self.authorized_stamp = None;
+        self.avatar_positions.clear();
+        self.avatar_slots.clear();
         self.wrap_cache.clear();
         self.measurement_queue.clear();
         self.measured_lines.clear();
@@ -647,6 +672,22 @@ impl PocketShell {
         placement
             .validate_for(&measured_viewport, &known)
             .map_err(str::to_string)?;
+        self.avatar_positions.clear();
+        for position in &placement.rows {
+            let context = self
+                .coordinator
+                .lock()
+                .unwrap()
+                .history()
+                .posts()
+                .iter()
+                .find(|post| post.uri == position.uri)
+                .and_then(|post| post.context);
+            // Body starts after the 22px header, 4px gap and optional context.
+            let y = position.y as f32 - 26.0 - if context.is_some() { 14.0 } else { 0.0 };
+            self.avatar_positions
+                .insert(position.uri.clone(), (position.x as f32, y));
+        }
         let mut commands = Vec::new();
         for position in &placement.rows {
             let Some(metrics) = known.iter().find(|metric| metric.uri == position.uri) else {
@@ -759,6 +800,19 @@ impl PocketShell {
             frame.draw_pocket_framebuffer(texture);
         }
         frame.with_clip_rectangle((0, 80, 960, 448), |frame| {
+            for (slot, uri) in &self.avatar_slots {
+                if let Some((x, y)) = self.avatar_positions.get(uri) {
+                    let _ = frame.draw_image_handle(
+                        cache,
+                        &self.image_handles,
+                        *slot,
+                        (x - 6.0) * 2.0,
+                        *y * 2.0,
+                        20.0,
+                        20.0,
+                    );
+                }
+            }
             for command in &self.native_batch.commands {
                 match command {
                     NativeCommand::Text {

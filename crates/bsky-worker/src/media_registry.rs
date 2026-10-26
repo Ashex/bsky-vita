@@ -17,6 +17,7 @@ pub struct PocketMediaRegistry {
     executor: MediaExecutor,
     scope: Option<AccountScope>,
     descriptors: HashMap<String, NativeAssetDescriptor>,
+    post_handles: HashMap<String, Vec<String>>,
 }
 
 impl Default for PocketMediaRegistry {
@@ -31,6 +32,7 @@ impl PocketMediaRegistry {
             executor: MediaExecutor::spawn_default(),
             scope: None,
             descriptors: HashMap::new(),
+            post_handles: HashMap::new(),
         }
     }
 
@@ -60,6 +62,116 @@ impl PocketMediaRegistry {
         self.scope = Some(scope);
         self.descriptors = indexed;
         true
+    }
+
+    /// Install only a coordinator-published page for the live account. Retain
+    /// descriptors exactly while their clean posts remain in bounded history.
+    pub fn install_accepted(
+        &mut self,
+        scope: AccountScope,
+        projected: &bsky_feed::ProjectedFeed,
+        effects: &[bsky_feed::FeedEffect],
+    ) -> bool {
+        let Some(history) = effects.iter().find_map(|effect| match effect {
+            bsky_feed::FeedEffect::PublishDelivery(delivery)
+                if delivery.correlation == projected.delivery.correlation =>
+            {
+                Some(delivery)
+            }
+            _ => None,
+        }) else {
+            return false;
+        };
+        if scope.auth_generation != projected.delivery.correlation.auth_generation
+            || !projected.validate_for(&scope.account_did)
+        {
+            return false;
+        }
+        let mut posts = if self.scope.as_ref() == Some(&scope)
+            && projected.delivery.correlation.cursor.is_some()
+        {
+            self.post_handles.clone()
+        } else {
+            HashMap::new()
+        };
+        posts.retain(|uri, _| {
+            history
+                .posts
+                .iter()
+                .any(|p| p.uri == *uri && p.state == bsky_feed::ContentState::Clean)
+        });
+        for (index, post) in projected.delivery.posts.iter().enumerate() {
+            if !history.posts.iter().any(|p| p.uri == post.uri)
+                || post.state != bsky_feed::ContentState::Clean
+            {
+                continue;
+            }
+            let prefix = format!(
+                "asset:{}:{index}:",
+                projected.delivery.correlation.request_id
+            );
+            posts.insert(
+                post.uri.clone(),
+                projected
+                    .native
+                    .descriptors
+                    .iter()
+                    .filter(|d| d.handle.starts_with(&prefix))
+                    .map(|d| d.handle.clone())
+                    .collect(),
+            );
+        }
+        let mut descriptors: Vec<_> = self
+            .descriptors
+            .values()
+            .filter(|d| posts.values().any(|handles| handles.contains(&d.handle)))
+            .cloned()
+            .collect();
+        for descriptor in &projected.native.descriptors {
+            if posts
+                .values()
+                .any(|handles| handles.contains(&descriptor.handle))
+            {
+                descriptors.retain(|d| d.handle != descriptor.handle);
+                descriptors.push(descriptor.clone());
+            }
+        }
+        if !self.install(scope, &descriptors) {
+            return false;
+        }
+        self.post_handles = posts;
+        true
+    }
+
+    /// Resolve post URIs in viewport order to bounded native asset slots.
+    pub fn visible_handles(&self, uris: &[String], limit: usize) -> Vec<String> {
+        uris.iter()
+            .filter_map(|uri| self.post_handles.get(uri))
+            .flatten()
+            .take(limit)
+            .cloned()
+            .collect()
+    }
+
+    pub fn post_for_handle(&self, handle: &str) -> Option<&str> {
+        self.post_handles
+            .iter()
+            .find(|(_, handles)| handles.iter().any(|h| h == handle))
+            .map(|(uri, _)| uri.as_str())
+    }
+
+    /// Resolve a completion back to its structured, installed identity.
+    pub fn descriptor_for_identity(
+        &self,
+        key: &AssetIdentityKey,
+    ) -> Option<&NativeAssetDescriptor> {
+        self.descriptors.values().find(|d| {
+            AssetIdentityKey::from_asset_identity(
+                &d.scope.account_did,
+                d.scope.auth_generation,
+                &d.identity,
+            ) == *key
+        })
     }
 
     /// Submit only a descriptor already installed for the current scope.
@@ -125,6 +237,7 @@ impl PocketMediaRegistry {
         self.executor.invalidate();
         self.scope = None;
         self.descriptors.clear();
+        self.post_handles.clear();
     }
 }
 
@@ -183,6 +296,69 @@ mod tests {
     }
     fn registry() -> PocketMediaRegistry {
         PocketMediaRegistry::new()
+    }
+
+    #[test]
+    fn accepted_pages_map_visible_posts_retain_history_and_reject_stale_scope() {
+        let mut r = registry();
+        let s = scope("did:plc:a", 3);
+        let mut coordinator = bsky_feed::FeedCoordinator::default();
+        coordinator.auth_changed(3);
+        coordinator.open_mount();
+        let mut first_handle = String::new();
+        for page in 0..2 {
+            let command = if page == 0 {
+                bsky_feed::FeedCommand::FirstPage
+            } else {
+                bsky_feed::FeedCommand::NextPage
+            };
+            let effects = coordinator.command(command);
+            let corr = effects
+                .iter()
+                .find_map(|e| match e {
+                    bsky_feed::FeedEffect::FetchPage(c) => Some(c.clone()),
+                    _ => None,
+                })
+                .unwrap();
+            let post: bsky_feed::PostDto = serde_json::from_value(serde_json::json!({
+                "uri": format!("post{page}"), "cid":"cid", "author": {
+                    "did":"did:plc:author", "handle":"author.test", "display_name":"Author"},
+                "text":"hello", "facets":[], "like_count":0, "repost_count":0,
+                "reply_count":0, "state":{"state":"clean"}, "quote":null, "images":[]
+            }))
+            .unwrap();
+            let delivery = bsky_feed::FeedDelivery {
+                schema: 1,
+                correlation: corr.clone(),
+                posts: vec![post],
+                cursor: Some("next".into()),
+            };
+            let handle = format!("asset:{}:0:avatar", corr.request_id);
+            if page == 0 {
+                first_handle = handle.clone();
+            }
+            let projected = bsky_feed::ProjectedFeed {
+                delivery: delivery.clone(),
+                native: bsky_feed::NativeFeedEnvelope {
+                    correlation: corr.clone(),
+                    descriptors: vec![descriptor(s.clone(), &handle, "revision")],
+                },
+            };
+            assert!(!r.install_accepted(s.clone(), &projected, &[]));
+            let accepted = coordinator.complete(&corr, Ok(delivery));
+            assert!(!r.install_accepted(scope("did:plc:other", 3), &projected, &accepted));
+            assert!(!r.install_accepted(scope("did:plc:a", 4), &projected, &accepted));
+            assert!(r.install_accepted(s.clone(), &projected, &accepted));
+            assert_eq!(r.visible_handles(&[format!("post{page}")], 8), vec![handle]);
+            assert_eq!(
+                r.visible_handles(&["post0".into()], 8),
+                vec![first_handle.clone()]
+            );
+            assert!(r.visible_handles(&["unknown".into()], 8).is_empty());
+            assert!(r.visible_handles(&["post0".into()], 0).is_empty());
+            let stale = coordinator.complete(&corr, Ok(projected.delivery.clone()));
+            assert!(!r.install_accepted(s.clone(), &projected, &stale));
+        }
     }
 
     #[test]

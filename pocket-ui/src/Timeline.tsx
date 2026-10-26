@@ -215,7 +215,7 @@ export function Timeline() {
     active = null;
     return "";
   };
-  const geometry = () => scrollWindow(delivery()?.posts ?? [], heights, scrollOffset(), ROW_LAYOUT.viewportHeight - ROW_LAYOUT.top, 64);
+  const geometry = () => scrollWindow(delivery()?.posts ?? [], heights, scrollOffset(), ROW_LAYOUT.viewportHeight - ROW_LAYOUT.top - ROW_LAYOUT.bottom, 64);
   const posts = () => {
     const history = delivery()?.posts ?? [];
     const set = new Set(geometry().rows.map((row) => row.uri));

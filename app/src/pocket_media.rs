@@ -10,7 +10,7 @@ use std::time::{Instant, SystemTime};
 
 use bsky_media::asset_cache::{AssetCache, AssetKind};
 use bsky_render::{ImageHandleMap, TextureCache};
-use bsky_worker::media_executor::{AssetIdentityKey, MediaCompletion};
+use bsky_worker::media_executor::AssetIdentityKey;
 use bsky_worker::media_registry::PocketMediaRegistry;
 
 pub use bsky_worker::media_registry::PocketMediaRegistry as Registry;
@@ -45,16 +45,13 @@ pub fn identity_tag(identity: &bsky_feed::AssetIdentity) -> String {
     }
 }
 
-fn is_avatar(identity: &AssetIdentityKey) -> bool {
-    identity.identity_tag.starts_with("avatar:")
-}
-
-fn identity_author(identity: &AssetIdentityKey) -> Option<&str> {
-    identity
-        .identity_tag
-        .strip_prefix("avatar:")?
-        .split(':')
-        .next()
+fn asset_kind(descriptor: &bsky_feed::NativeAssetDescriptor) -> AssetKind {
+    match &descriptor.identity {
+        bsky_feed::AssetIdentity::Avatar { .. } => AssetKind::Avatar {
+            followed: descriptor.following_confirmed,
+        },
+        bsky_feed::AssetIdentity::PostImage { .. } => AssetKind::PostImage { persist: true },
+    }
 }
 
 /// Insert bytes into the texture cache, using the RGBA path (and circular
@@ -89,60 +86,56 @@ pub fn service(
     handles: &mut ImageHandleMap,
     visible: &[String],
 ) -> usize {
-    let followed_for = |author: &str| -> bool {
-        visible.iter().any(|handle| {
-            registry.descriptor(handle).is_some_and(|d| {
-                d.following_confirmed
-                    && matches!(
-                        &d.identity,
-                        bsky_feed::AssetIdentity::Avatar { author_did, .. } if author_did == author
-                    )
-            })
-        })
-    };
+    let visible = registry.visible_handles(visible, bsky_pocket::MAX_NATIVE_IMAGE_HANDLES);
 
     let mut installed = 0usize;
     for completion in registry.drain() {
-        let avatar = is_avatar(&completion.identity);
-        let key = identity_key(&completion.identity);
-        if cache.contains(&key) {
+        let Some(descriptor) = registry.descriptor_for_identity(&completion.identity) else {
             continue;
-        }
+        };
+        let kind = asset_kind(descriptor);
+        let avatar = matches!(kind, AssetKind::Avatar { .. });
+        let key = identity_key(&completion.identity);
         let Ok(bytes) = completion.bytes.as_ref() else {
             continue;
         };
-        let followed_author = followed_for(identity_author(&completion.identity).unwrap_or(""));
-        let _ = disk.put(
-            &completion.identity,
-            AssetKind::Avatar {
-                followed: followed_author,
-            },
-            bytes,
-        );
+        let _ = disk.put(&completion.identity, kind, bytes);
         if insert_texture(cache, &key, bytes, avatar) {
             installed += 1;
         }
     }
 
     handles.clear();
-    let mut next_handle = 1u32;
-    for handle in visible {
+    let mut missing = Vec::new();
+    for (slot, handle) in visible.iter().enumerate() {
         let Some(descriptor) = registry.descriptor(handle) else {
             continue;
         };
-        let key = format!(
-            "asset:{}:{}:{}",
-            descriptor.scope.account_did,
+        let identity = AssetIdentityKey::from_asset_identity(
+            &descriptor.scope.account_did,
             descriptor.scope.auth_generation,
-            identity_tag(&descriptor.identity)
+            &descriptor.identity,
         );
-        if cache.contains(&key) && handles.insert(next_handle, key) {
-            next_handle = next_handle.saturating_add(1);
+        let key = identity_key(&identity);
+        let kind = asset_kind(descriptor);
+        let fresh = prime_from_disk(
+            cache,
+            disk,
+            &identity,
+            kind,
+            matches!(kind, AssetKind::Avatar { .. }),
+        )
+        .is_some();
+        if cache.contains(&key) {
+            handles.insert(slot as u32 + 1, key);
+        }
+        if !fresh {
+            missing.push(handle.clone());
         }
     }
 
     let deadline = Instant::now() + MEDIA_FETCH_BUDGET;
-    registry.submit_visible(visible.iter().cloned(), deadline, VISIBLE_SUBMIT_LIMIT);
+    registry.submit_visible(missing, deadline, VISIBLE_SUBMIT_LIMIT);
     installed
 }
 
@@ -155,11 +148,21 @@ pub fn prime_from_disk(
     avatar: bool,
 ) -> Option<String> {
     let key = identity_key(identity);
-    if cache.contains(&key) {
-        return Some(key);
-    }
-    let (bytes, _fresh) = disk.get(identity, kind, SystemTime::now()).ok()??;
-    insert_texture(cache, &key, &bytes, avatar).then_some(key)
+    let present = cache.contains(&key);
+    let fresh = restore_bytes(disk, identity, kind, |bytes| {
+        present || insert_texture(cache, &key, bytes, avatar)
+    })?;
+    fresh.then_some(key)
+}
+
+fn restore_bytes(
+    disk: &AssetCache,
+    identity: &AssetIdentityKey,
+    kind: AssetKind,
+    mut upload: impl FnMut(&[u8]) -> bool,
+) -> Option<bool> {
+    let (bytes, state) = disk.get(identity, kind, SystemTime::now()).ok()??;
+    upload(&bytes).then_some(state.fresh)
 }
 
 #[cfg(test)]
@@ -184,20 +187,67 @@ mod tests {
 
     #[test]
     fn identity_author_extracts_the_did() {
-        let key = AssetIdentityKey {
-            scope_did: "did:plc:me".into(),
-            auth_generation: 1,
-            identity_tag: "avatar:did:plc:author:rev9".into(),
+        let identity = bsky_feed::AssetIdentity::Avatar {
+            author_did: "did:plc:author".into(),
+            source_revision: "https://cdn.example/avatar:revision".into(),
         };
-        assert_eq!(identity_author(&key), Some("did:plc:author"));
-        let image = AssetIdentityKey {
-            scope_did: "did:plc:me".into(),
-            auth_generation: 1,
-            identity_tag: "image:at://x/1:bafy:0:t:f".into(),
+        let key = AssetIdentityKey::from_asset_identity("did:plc:me", 1, &identity);
+        let descriptor = bsky_feed::NativeAssetDescriptor {
+            scope: bsky_feed::AccountScope {
+                account_did: "did:plc:me".into(),
+                auth_generation: 1,
+            },
+            identity,
+            handle: "h".into(),
+            relationship: bsky_feed::Relationship::Followed,
+            following_confirmed: true,
         };
-        assert_eq!(identity_author(&image), None);
-        assert!(!is_avatar(&image));
-        assert!(is_avatar(&key));
+        let mut registry = Registry::new();
+        assert!(registry.install(descriptor.scope.clone(), &[descriptor]));
+        let restored = registry.descriptor_for_identity(&key).unwrap();
+        assert!(
+            matches!(&restored.identity, bsky_feed::AssetIdentity::Avatar { author_did, .. }
+            if author_did == "did:plc:author")
+        );
+        assert_eq!(asset_kind(restored), AssetKind::Avatar { followed: true });
+        let mut image = restored.clone();
+        image.identity = bsky_feed::AssetIdentity::PostImage {
+            post_uri: "post".into(),
+            cid: "cid".into(),
+            index: 0,
+            thumbnail: "t".into(),
+            fullsize: "f".into(),
+        };
+        assert_eq!(asset_kind(&image), AssetKind::PostImage { persist: true });
+    }
+
+    #[test]
+    fn restart_restores_fresh_bytes_before_network_and_failed_upload_is_a_miss() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = AssetIdentityKey::from_asset_identity(
+            "did:plc:me",
+            1,
+            &bsky_feed::AssetIdentity::Avatar {
+                author_did: "did:plc:author".into(),
+                source_revision: "revision".into(),
+            },
+        );
+        let kind = AssetKind::Avatar { followed: true };
+        AssetCache::new(dir.path())
+            .put(&identity, kind, b"cached-image")
+            .unwrap();
+        let restarted = AssetCache::new(dir.path());
+        let mut uploads = 0;
+        assert_eq!(
+            restore_bytes(&restarted, &identity, kind, |bytes| {
+                uploads += 1;
+                assert_eq!(bytes, b"cached-image");
+                true
+            }),
+            Some(true)
+        );
+        assert_eq!(uploads, 1);
+        assert_eq!(restore_bytes(&restarted, &identity, kind, |_| false), None);
     }
 
     #[test]

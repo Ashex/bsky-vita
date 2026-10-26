@@ -8,6 +8,12 @@ build = "build.rs"
 [build-dependencies]
 cc = "1"
 
+[dev-dependencies]
+bsky-media = { path = "../bsky-media" }
+bsky-render = { path = "../bsky-render" }
+bsky-worker = { path = "../bsky-worker" }
+tempfile = "3"
+
 [dependencies]
 bsky-feed = { path = "../bsky-feed" }
 pocketjs-core = { path = "../../vendor/pocketjs/engine/core" }

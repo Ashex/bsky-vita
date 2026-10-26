@@ -355,22 +355,6 @@ fn main() {
                 };
                 #[cfg(feature = "pocketjs-poc")]
                 if let WorkResponse::FeedPageProjected { correlation, batch } = &resp {
-                    if correlation.auth_generation == auth_generation {
-                        if let Ok(projected) = batch {
-                            let scope = projected
-                                .native
-                                .descriptors
-                                .first()
-                                .map(|d| d.scope.clone())
-                                .unwrap_or_else(|| bsky_feed::AccountScope {
-                                    account_did: String::new(),
-                                    auth_generation: correlation.auth_generation,
-                                });
-                            if !pocket_media.install(scope, &projected.native.descriptors) {
-                                bsky_log::log!("PocketJS native media descriptor install rejected");
-                            }
-                        }
-                    }
                     let converted = bsky_feed::FeedCorrelation {
                         schema: correlation.schema,
                         auth_generation: correlation.auth_generation,
@@ -390,6 +374,16 @@ fn main() {
                         },
                     );
                     if correlation.auth_generation == auth_generation {
+                        if let (Ok(projected), Some(client)) = (batch, auth_client.as_ref()) {
+                            pocket_media.install_accepted(
+                                bsky_feed::AccountScope {
+                                    account_did: client.resolved.did.to_string(),
+                                    auth_generation,
+                                },
+                                projected,
+                                &effects,
+                            );
+                        }
                         run_pocket_effects(effects, worker.as_ref(), pocket_shell.as_mut());
                     }
                 }
@@ -406,6 +400,7 @@ fn main() {
 
         #[cfg(feature = "pocketjs-poc")]
         if let Some(shell) = pocket_shell.as_mut() {
+            shell.bind_avatar_slots(&pocket_media);
             let visible: Vec<String> = shell.visible_uris().to_vec();
             pocket_media::service(
                 &pocket_media,

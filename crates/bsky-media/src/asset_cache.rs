@@ -60,7 +60,7 @@ impl AssetCache {
         }
         let path = self.entry_path(key);
         let stored = match fs::read(&path) {
-            Ok(bytes) if bytes.len() >= 8 => bytes,
+            Ok(bytes) if bytes.len() >= 16 => bytes,
             Ok(_) => {
                 let _ = fs::remove_file(path);
                 return Ok(None);
@@ -72,21 +72,19 @@ impl AssetCache {
             }
         };
         let expected = u64::from_le_bytes(stored[..8].try_into().unwrap()) as usize;
-        if stored.len() != expected.saturating_add(8) {
+        if stored.len() != expected.saturating_add(16) {
             let _ = fs::remove_file(path);
             return Ok(None);
         }
-        let bytes = stored[8..].to_vec();
-        let modified = match fs::metadata(&path) {
-            Ok(metadata) => metadata.modified().unwrap_or(UNIX_EPOCH),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(_) => {
-                let _ = fs::remove_file(path);
-                return Ok(None);
-            }
+        let Some(fetched_at) = UNIX_EPOCH.checked_add(Duration::from_secs(u64::from_le_bytes(
+            stored[8..16].try_into().unwrap(),
+        ))) else {
+            let _ = fs::remove_file(path);
+            return Ok(None);
         };
+        let bytes = stored[16..].to_vec();
         let ttl = ttl_for(kind);
-        let fresh = now.duration_since(modified).unwrap_or_default() < ttl;
+        let fresh = now.duration_since(fetched_at).unwrap_or_default() < ttl;
         // Successful reads update the LRU timestamp. The file is already
         // fully read into owned bytes, so eviction cannot invalidate callers.
         if let Ok(file) = fs::File::open(&path) {
@@ -103,8 +101,15 @@ impl AssetCache {
         let path = self.entry_path(key);
         let tmp = sidecar(&path);
         let result: io::Result<()> = (|| {
-            let mut payload = Vec::with_capacity(bytes.len() + 8);
+            let mut payload = Vec::with_capacity(bytes.len() + 16);
             payload.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+            payload.extend_from_slice(
+                &SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+                    .to_le_bytes(),
+            );
             payload.extend_from_slice(bytes);
             fs::write(&tmp, payload)?;
             if path.exists() {
@@ -239,6 +244,39 @@ mod tests {
             .unwrap();
         assert!(!got.1.fresh);
         assert_eq!(got.0, b"avatar-bytes-valid");
+        // Age both clocks. Real-time reads may touch LRU, never freshness.
+        let old = SystemTime::now() - OTHER_TTL - Duration::from_secs(10);
+        let mut payload = fs::read(c.entry_path(&k)).unwrap();
+        payload[8..16].copy_from_slice(
+            &old.duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                .to_le_bytes(),
+        );
+        fs::write(c.entry_path(&k), payload).unwrap();
+        fs::File::open(c.entry_path(&k))
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(old))
+            .unwrap();
+        for _ in 0..3 {
+            assert!(
+                !c.get(&k, AssetKind::Avatar { followed: false }, SystemTime::now())
+                    .unwrap()
+                    .unwrap()
+                    .1
+                    .fresh
+            );
+        }
+        assert!(fs::metadata(c.entry_path(&k)).unwrap().modified().unwrap() > old);
+        let restarted = AssetCache::new(d.path());
+        assert_eq!(
+            restarted
+                .get(&k, AssetKind::Avatar { followed: false }, SystemTime::now())
+                .unwrap()
+                .unwrap()
+                .0,
+            b"avatar-bytes-valid"
+        );
     }
 
     #[test]
@@ -252,7 +290,7 @@ mod tests {
     #[test]
     fn eviction_removes_lru_and_observes_quota() {
         let d = tempfile::tempdir().unwrap();
-        let c = AssetCache::with_avatar_quota(d.path(), 20);
+        let c = AssetCache::with_avatar_quota(d.path(), 30);
         let a = key("a");
         let b = key("b");
         c.put(&a, AssetKind::Avatar { followed: false }, b"123456")
@@ -266,7 +304,7 @@ mod tests {
             .filter_map(|e| e.metadata().ok())
             .map(|m| m.len())
             .sum();
-        assert!(used <= 20);
+        assert!(used <= 30);
         assert!(c
             .get(&a, AssetKind::Avatar { followed: false }, SystemTime::now())
             .unwrap()

@@ -29,7 +29,24 @@ Test counts at `cedc58b`: `bsky-worker` 51, `bsky-pocket` 24 unit + 2
 containment + 3 QuickJS + 8 runtime, `bsky-render` 13, `bsky-media` 12,
 guest TS 20.
 
-## Integration is NOT complete
+## Acceptance repair status (2026-10-26)
+
+The repair after `ab15f1e` wires coordinator-accepted, live-account pages to a
+bounded post-to-handle registry retained with feed history. The app now resolves
+visible post URIs before restoring disk bytes, submitting missing/stale assets,
+and binding native avatar draw slots. Earlier integration findings below are
+historical, not a description of the repaired source.
+
+**The icon atlas is STAGED, not integrated.** `app/static/pocket_icons.png` and
+`crates/bsky-render/src/pocket_icon_table.rs` still have no presentation consumer.
+They are not evidence of rendered icons. D8's real consumer remains deferred:
+introducing atlas texture ownership, source-rectangle draws, and guest/native
+placement without device rendering validation is outside this repair's verified
+presentation path. A follow-up must wire those together and verify on a Vita.
+No device rendering, masking, filesystem semantics, or performance is verified
+by the host tests or VPK build.
+
+## Historical integration findings (before acceptance repair)
 
 An independent review at `dce903f` established that the media machinery is
 correct in isolation but not yet connected end to end. Treat these as the

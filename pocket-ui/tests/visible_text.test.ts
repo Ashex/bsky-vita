@@ -18,6 +18,14 @@ import {
 } from "../src/visible_text";
 
 describe("visible text contract", () => {
+  it("uses the native 224px viewport for selection and bottom-edge visibility", () => {
+    const height = ROW_LAYOUT.viewportHeight - ROW_LAYOUT.top - ROW_LAYOUT.bottom;
+    expect([ROW_LAYOUT.top, ROW_LAYOUT.top + height, height]).toEqual([40, 264, 224]);
+    const history = [{ uri: "a" }, { uri: "b" }];
+    const heights = new Map([["a", 217], ["b", 100]]);
+    expect(scrollWindow(history, heights, 0, height, 0).rows.map((row) => row.uri)).toEqual(["a"]);
+    expect(scrollWindow(history, heights, 1, height, 0).rows.map((row) => row.uri)).toEqual(["a", "b"]);
+  });
   it("captures only an initial single rail contact and blocks incomplete or multi-touch gestures", () => {
     const contact = (id: number, x: number, y: number) => ({ id, x, y });
     let result = reduceTouchRail(null, [contact(7, 456, 100)]);

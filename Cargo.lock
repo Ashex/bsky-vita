@@ -291,6 +291,9 @@ name = "bsky-pocket"
 version = "1.0.0"
 dependencies = [
  "bsky-feed",
+ "bsky-media",
+ "bsky-render",
+ "bsky-worker",
  "cc",
  "pocket-drivers",
  "pocket-package",
@@ -300,6 +303,7 @@ dependencies = [
  "pocketjs-core",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

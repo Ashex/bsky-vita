@@ -9,13 +9,10 @@ pub const MAX_AGGREGATE_DESCRIPTOR_BYTES: usize = 4 * 1024 * 1024;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AssetHandleKind {
     Avatar,
-    Image,
+    Image(u32),
 }
 
-fn parse_asset_handle(
-    handle: &str,
-    request_id: u64,
-) -> Option<(usize, AssetHandleKind)> {
+fn parse_asset_handle(handle: &str, request_id: u64) -> Option<(usize, AssetHandleKind)> {
     if handle.len() > 256 {
         return None;
     }
@@ -49,7 +46,7 @@ fn parse_asset_handle(
         if handle != expected_full {
             return None;
         }
-        AssetHandleKind::Image
+        AssetHandleKind::Image(image_index)
     };
     Some((post_index, kind))
 }
@@ -168,7 +165,7 @@ impl NativeFeedEnvelope {
                     thumbnail,
                     fullsize,
                 } => {
-                    if identity_kind != AssetHandleKind::Image {
+                    if identity_kind != AssetHandleKind::Image(*index) {
                         return false;
                     }
                     if cid.is_empty()
@@ -235,12 +232,23 @@ impl ProjectedFeed {
 
     pub fn validate_for(&self, expected_account_did: &str) -> bool {
         self.delivery.schema == crate::SCHEMA_VERSION
-            && serde_json::to_vec(&self.delivery).is_ok_and(|bytes| bytes.len() <= crate::MAX_DELIVERY_BYTES)
+            && serde_json::to_vec(&self.delivery)
+                .is_ok_and(|bytes| bytes.len() <= crate::MAX_DELIVERY_BYTES)
             && self.delivery.posts.len() <= crate::MAX_HISTORY
             && self.delivery.correlation.validate().is_ok()
-            && self.delivery.cursor.as_ref().is_none_or(|c| c.len() <= crate::MAX_FIELD_BYTES)
-            && self.delivery.posts.iter().all(|post| post.validate().is_ok())
-            && self.native.matches_for(&self.delivery, expected_account_did)
+            && self
+                .delivery
+                .cursor
+                .as_ref()
+                .is_none_or(|c| c.len() <= crate::MAX_FIELD_BYTES)
+            && self
+                .delivery
+                .posts
+                .iter()
+                .all(|post| post.validate().is_ok())
+            && self
+                .native
+                .matches_for(&self.delivery, expected_account_did)
     }
 
     pub fn validate(&self) -> bool {
