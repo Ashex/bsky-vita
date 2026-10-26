@@ -78,6 +78,7 @@ use crossbeam_channel::{bounded, unbounded, Receiver, Sender, TryRecvError};
 use futures::executor::block_on;
 use std::time::{Duration, Instant};
 mod feed_projection;
+pub mod media_executor;
 use feed_projection::{project_page, project_page_with_native};
 
 /// Identifies which feed a `FetchFeed` request targets.
